@@ -1,0 +1,57 @@
+{
+  "name": "airchat",
+  "productName": "AirChat",
+  "version": "1.0.0",
+  "description": "UDP чат с голосом на Electron + Go",
+  "main": "main.js",
+  "scripts": {
+    "build:go": "cd src/go_server && go mod tidy && go build -o ../../bin/server.exe && cd ../go_client && go mod tidy && go build -o ../../bin/client.exe",
+    "start": "npm run build:go && electron-forge start",
+    "make": "npm run build:go && electron-forge make",
+    "clean": "rimraf bin/*.exe out node_modules",
+    "lint": "echo \"No linting configured\""
+  },
+  "keywords": [],
+  "author": "alex2",
+  "license": "MIT",
+  "devDependencies": {
+    "@electron-forge/cli": "^6.0.0",
+    "@electron-forge/maker-squirrel": "^6.0.0",
+    "@electron-forge/maker-zip": "^6.0.0",
+    "electron": "^28.1.0",
+    "electron-reloader": "^1.2.3",
+    "rimraf": "^5.0.5"
+  },
+  "config": {
+    "forge": {
+      "packagerConfig": {
+        "extraFiles": [
+          {
+            "from": "bin/server.exe",
+            "to": "server.exe" 
+          },
+          {
+            "from": "bin/client.exe",
+            "to": "client.exe" 
+          }
+        ],
+        "ignore": [
+          "/src/go_server",
+          "/src/go_client",
+          "/.gitignore",
+          "/go.mod",
+          "/go.sum"
+        ]
+      },
+      "makers": [
+        {
+          "name": "@electron-forge/maker-squirrel"
+        },
+        {
+          "name": "@electron-forge/maker-zip",
+          "platforms": ["win32"]
+        }
+      ]
+    }
+  }
+}

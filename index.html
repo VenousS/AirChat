@@ -1,0 +1,51 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'">
+    <link rel="stylesheet" href="style.css">
+
+    <title>AirChat</title>
+</head>
+<body>
+    <header>
+        <div class="logo">
+            <span class="z-icon">ℤ</span>
+            <span class="logo-text">AirChat</span>
+        </div>
+    </header>
+    
+    <div id="login-container" class="container">
+        <h1>Добро пожаловать в AirChat</h1>
+        <div class="form-group">
+            <input type="text" id="username" placeholder="Ваше имя" class="input-field">
+        </div>
+        <div class="form-group">
+            <input type="text" id="server-ip" placeholder="IP сервера (например, 127.0.0.1)" class="input-field">
+        </div>
+        <div class="form-group">
+            <button class="chat-button" id="createRoomBtn">Создать комнату</button>
+            <button class="chat-button" id="connectButton">Войти в чат</button>
+        </div>
+    </div>
+
+    <div id="chat-container" class="chat-window" style="display:none;">
+        <div class="chat-header">
+            <h2>AirChat</h2>
+            <div class="chat-controls">
+                <button id="voiceChatBtn" class="control-btn">🎤 Голосовой чат</button>
+                <button id="exitChatBtn" class="control-btn">🚪 Выйти</button>
+            </div>
+        </div>
+        
+        <div id="message-area" class="message-area"></div>
+        
+        <div class="message-input">
+            <input type="text" id="message-input" placeholder="Введите сообщение..." class="input-field">
+            <button id="sendBtn" class="send-btn">Отправить</button>
+        </div>
+    </div>
+
+    <script src="./renderer.js"></script>
+</body>
+</html>
