@@ -82,7 +82,7 @@ document.addEventListener('DOMContentLoaded', () => {
             serverProcess = null;
         });
 
-        addSystemMessage('Сервер чата запущен на 127.0.0.1:6000');
+        addSystemMessage('Сервер чата запущен');
     });
 
     // Войти в чат (запустить client.exe)
