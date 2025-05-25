@@ -4,23 +4,28 @@
   "version": "1.0.0",
   "description": "UDP чат с голосом на Electron + Go",
   "main": "main.js",
-  "scripts": {
-    "build:go": "cd src/go_server && go mod tidy && go build -o ../../bin/server.exe && cd ../go_client && go mod tidy && go build -o ../../bin/client.exe",
-    "start": "npm run build:go && electron-forge start",
-    "make": "npm run build:go && electron-forge make",
-    "clean": "rimraf bin/*.exe out node_modules",
-    "lint": "echo \"No linting configured\""
-  },
-  "keywords": [],
-  "author": "alex2",
+  "author": "VenousS",
   "license": "MIT",
   "devDependencies": {
-    "@electron-forge/cli": "^6.0.0",
-    "@electron-forge/maker-squirrel": "^6.0.0",
-    "@electron-forge/maker-zip": "^6.0.0",
-    "electron": "^28.1.0",
-    "electron-reloader": "^1.2.3",
-    "rimraf": "^5.0.5"
+    "@electron-forge/cli": "^7.8.1",
+    "@electron-forge/maker-deb": "^7.8.1",
+    "@electron-forge/maker-rpm": "^7.8.1",
+    "@electron-forge/maker-squirrel": "^7.8.1",
+    "@electron-forge/maker-zip": "^7.8.1",
+    "@electron-forge/plugin-auto-unpack-natives": "^7.8.1",
+    "@electron-forge/plugin-fuses": "^7.8.1",
+    "@electron/fuses": "^1.8.0",
+    "electron": "36.3.1"
+  },
+  "dependencies": {
+    "electron-squirrel-startup": "^1.0.1"
+  },
+  "scripts": {
+    "clean": "rimraf bin/*.exe out node_modules",
+    "build:go": "cd src/go_server && go mod tidy && go build -o ../../bin/server.exe && cd ../go_client && go mod tidy && go build -o ../../bin/client.exe",
+    "start": "npm run build:go && electron-forge start",
+    "package": "electron-forge package",
+    "make": "electron-forge make"
   },
   "config": {
     "forge": {
@@ -28,28 +33,26 @@
         "extraFiles": [
           {
             "from": "bin/server.exe",
-            "to": "server.exe" 
+            "to": "server.exe"
           },
           {
             "from": "bin/client.exe",
-            "to": "client.exe" 
+            "to": "client.exe"
           }
-        ],
-        "ignore": [
-          "/src/go_server",
-          "/src/go_client",
-          "/.gitignore",
-          "/go.mod",
-          "/go.sum"
         ]
       },
       "makers": [
         {
-          "name": "@electron-forge/maker-squirrel"
+          "name": "@electron-forge/maker-squirrel",
+          "config": {
+            "name": "airchat"
+          }
         },
         {
           "name": "@electron-forge/maker-zip",
-          "platforms": ["win32"]
+          "platforms": [
+            "win32"
+          ]
         }
       ]
     }

@@ -1,47 +1,36 @@
 const { app, BrowserWindow } = require('electron');
 const path = require('path');
 const { spawn } = require('child_process');
-const fs = require('fs'); // Добавили для проверки файлов
+const fs = require('fs');
 
-let serverProcess; // Вынесли в глобальную область видимости
-let clientProcess; // Если клиент тоже нужен
-
-if (process.env.NODE_ENV === 'development') {
-    try {
-        require('electron-reloader')(module, {
-            debug: true,
-            watchRenderer: true
-        });
-    } catch (err) {
-        console.error('Electron reloader error:', err);
-    }
+// Устанавливаем кодировку для консоли
+if (process.platform === 'win32') {
+    spawn('chcp', ['65001'], { shell: true });
 }
 
-function createWindow() {
-    const win = new BrowserWindow({
+let serverProcess;
+let clientProcess;
+let mainWindow;
+
+const createWindow = () => {
+    mainWindow = new BrowserWindow({
         width: 900,
         height: 700,
         webPreferences: {
-            preload: path.join(__dirname, 'preload.js'),
             nodeIntegration: true,
             contextIsolation: false
         }
     });
 
-    win.loadFile('index.html');
+    mainWindow.loadFile('index.html');
 
     if (process.env.NODE_ENV === 'development') {
-        win.webContents.openDevTools();
+        mainWindow.webContents.openDevTools();
     }
 
     // Пути к бинарникам
-    const serverPath = process.env.NODE_ENV === 'development' 
-        ? path.join(__dirname, 'bin', 'server.exe')
-        : path.join(process.resourcesPath, 'server.exe');
-
-    const clientPath = process.env.NODE_ENV === 'development' 
-        ? path.join(__dirname, 'bin', 'client.exe')
-        : path.join(process.resourcesPath, 'client.exe');
+    const serverPath = path.join(__dirname, 'bin', 'server.exe');
+    const clientPath = path.join(__dirname, 'bin', 'client.exe');
 
     // Проверка существования файлов
     if (!fs.existsSync(serverPath)) {
@@ -55,13 +44,8 @@ function createWindow() {
     // Запуск Go-сервера
     serverProcess = spawn(serverPath, [], {
         shell: true,
-        windowsHide: false
-    });
-
-    // Запуск Go-клиента (если требуется)
-    clientProcess = spawn(clientPath, [], {
-        shell: true,
-        windowsHide: false
+        windowsHide: false,
+        env: { ...process.env, LANG: 'ru_RU.UTF-8' }
     });
 
     // Логирование для сервера
@@ -79,18 +63,11 @@ function createWindow() {
 
     serverProcess.on('error', err => {
         console.error('Ошибка сервера:', err);
-        win.webContents.send('server-crash', err.message);
+        if (mainWindow) {
+            mainWindow.webContents.send('server-error', err.message);
+        }
     });
-
-    // Логирование для клиента (аналогично)
-    clientProcess.stdout.on('data', data => {
-        console.log('[Client]', data.toString());
-    });
-
-    clientProcess.stderr.on('data', data => {
-        console.error('[Client Error]', data.toString());
-    });
-}
+};
 
 app.whenReady().then(() => {
     createWindow();
@@ -103,11 +80,13 @@ app.whenReady().then(() => {
 });
 
 app.on('window-all-closed', () => {
-    // Убиваем процессы перед выходом
-    if (serverProcess) serverProcess.kill('SIGTERM');
-    if (clientProcess) clientProcess.kill('SIGTERM');
-
+    if (serverProcess) {
+        serverProcess.kill();
+    }
+    if (clientProcess) {
+        clientProcess.kill();
+    }
     if (process.platform !== 'darwin') {
         app.quit();
     }
-});
+}); 
