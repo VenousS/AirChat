@@ -15,10 +15,23 @@ import (
 )
 
 const (
-	sampleRate = 48000
-	channels   = 1
-	frameSize  = 960   // 20ms at 48kHz
-	maxBytes   = 12500 // Увеличиваем размер буфера для лучшего качества
+	sampleRate       = 48000
+	channels         = 1
+	frameSize        = 960  // 20мс при 48кГц
+	maxBytes         = 1275 // Максимальный размер пакета Opus
+	jitterBufferSize = 20   // 400мс буфер для большей стабильности
+	noiseThreshold   = 0.02 // Порог шумоподавления (возможно, стоит также пересмотреть)
+
+	// Константы обработки аудио
+	vadThreshold         = 0.005 // Порог определения голосовой активности
+	softGateFactor       = 0.1   // Коэффициент ослабления для мягкого гейта
+	gainFactor           = 1.2   // Небольшое усиление для слабых сигналов
+	compressionThreshold = 0.8   // Порог для компрессии динамического диапазона
+	vadHangoverTimeMs    = 150   // Время удержания VAD в миллисекундах
+
+	// Константы буферизации
+	inputBufferMultiplier = 3 // Размер входного буфера относительно frameSize
+	minBufferThreshold    = 7 // Минимальное количество фреймов для начала воспроизведения
 )
 
 var (
@@ -26,7 +39,10 @@ var (
 	stopAudio     chan struct{}
 	audioWg       sync.WaitGroup
 	paInitialized bool = false
-	debugMode     bool = true // Включаем режим отладки
+
+	// Вычисляем количество кадров для удержания VAD
+	// Длительность одного фрейма = frameSize / sampleRate = 960 / 48000 = 0.02 сек = 20 мс
+	vadHangoverFrames = vadHangoverTimeMs / 20
 )
 
 type AudioState struct {
@@ -47,6 +63,138 @@ type AudioBuffer struct {
 	OpusOutputBuf []int16
 	Encoder       *opus.Encoder
 	Decoder       *opus.Decoder
+	JitterBuffer  [][]float32 // Буфер для сглаживания воспроизведения
+}
+
+// JitterBuffer управляет временем пакетов аудио
+type JitterBuffer struct {
+	buffer    [][]float32
+	maxSize   int
+	frameSize int
+	mutex     sync.RWMutex
+}
+
+func NewJitterBuffer(size int, frameSize int) *JitterBuffer {
+	return &JitterBuffer{
+		buffer:    make([][]float32, 0, size),
+		maxSize:   size,
+		frameSize: frameSize,
+	}
+}
+
+func (jb *JitterBuffer) Add(data []float32) {
+	jb.mutex.Lock()
+	defer jb.mutex.Unlock()
+
+	if len(jb.buffer) >= jb.maxSize {
+		// Буфер полон, удаляем самый старый фрейм
+		jb.buffer = jb.buffer[1:]
+	}
+
+	// Создаем копию данных
+	frame := make([]float32, len(data))
+	copy(frame, data)
+
+	jb.buffer = append(jb.buffer, frame)
+}
+
+func (jb *JitterBuffer) Get() []float32 {
+	jb.mutex.Lock()
+	defer jb.mutex.Unlock()
+
+	if len(jb.buffer) == 0 {
+		return make([]float32, jb.frameSize) // Возвращаем тишину если буфер пуст
+	}
+
+	// Получаем самый старый фрейм
+	frame := jb.buffer[0]
+	jb.buffer = jb.buffer[1:]
+	return frame
+}
+
+func (jb *JitterBuffer) Available() int {
+	jb.mutex.RLock()
+	defer jb.mutex.RUnlock()
+	return len(jb.buffer)
+}
+
+// Enhanced audio processing
+type AudioProcessor struct {
+	vadEnabled           bool
+	lastVadState         bool
+	energyThreshold      float32
+	smoothingFactor      float32
+	noiseFloor           float32
+	framesSinceLastVoice int // Счетчик кадров с момента последнего обнаружения голоса
+	vadHangoverFrames    int // Количество кадров для удержания VAD
+}
+
+func NewAudioProcessor() *AudioProcessor {
+	return &AudioProcessor{
+		vadEnabled:           true,
+		lastVadState:         false,
+		energyThreshold:      vadThreshold,
+		smoothingFactor:      0.95,
+		noiseFloor:           0.001,
+		framesSinceLastVoice: 0,                 // Инициализация счетчика
+		vadHangoverFrames:    vadHangoverFrames, // Инициализация из вычисленной глобальной переменной
+	}
+}
+
+func (ap *AudioProcessor) ProcessInput(buffer []float32) []float32 {
+	// Создаем копию входного буфера
+	processed := make([]float32, len(buffer))
+	copy(processed, buffer)
+
+	// Вычисляем энергию сигнала
+	energy := float32(0)
+	for _, sample := range processed {
+		energy += sample * sample
+	}
+	energy /= float32(len(processed))
+
+	// Определение голосовой активности
+	if energy > ap.energyThreshold {
+		ap.framesSinceLastVoice = 0 // Голос есть, сбрасываем счетчик
+	} else {
+		ap.framesSinceLastVoice++ // Голоса нет, увеличиваем счетчик
+	}
+
+	// Мягкий гейт с учетом времени удержания
+	if ap.framesSinceLastVoice > ap.vadHangoverFrames {
+		for i := range processed {
+			processed[i] *= softGateFactor // Ослабляем сигнал, а не обнуляем
+		}
+		return processed
+	}
+
+	// Фильтр высоких частот (пропускаем только частоты выше определенного порога)
+	applyHighPassFilter(processed)
+
+	// Динамическая компрессия диапазона (уменьшение разницы между самыми тихими и громкими звуками)
+	ap.applyCompression(processed)
+
+	// Финальная нормализация амплитуды (приведение громкости к стандартному уровню)
+	normalizeAmplitude(processed)
+
+	return processed
+}
+
+func (ap *AudioProcessor) applyCompression(buffer []float32) {
+	// Find peak amplitude
+	peak := float32(0)
+	for _, sample := range buffer {
+		if abs := float32(math.Abs(float64(sample))); abs > peak {
+			peak = abs
+		}
+	}
+
+	if peak > compressionThreshold {
+		ratio := compressionThreshold / peak
+		for i := range buffer {
+			buffer[i] *= ratio
+		}
+	}
 }
 
 func float32ToInt16(float32Buf []float32) []int16 {
@@ -90,17 +238,46 @@ func terminatePortAudio() {
 	}
 }
 
+// Функция для фильтрации низких частот
+func applyHighPassFilter(buf []float32) {
+	rc := 1.0 / (2 * math.Pi * 100.0) // Частота среза 100 Гц
+	dt := 1.0 / float64(sampleRate)
+	alpha := float32(rc / (rc + dt))
+	prev := float32(0)
+	for i := range buf {
+		buf[i] = alpha * (prev + buf[i] - prev)
+		prev = buf[i]
+	}
+}
+
+// Функция для нормализации амплитуды
+func normalizeAmplitude(buf []float32) {
+	max := float32(0)
+	for _, s := range buf {
+		if abs := float32(math.Abs(float64(s))); abs > max {
+			max = abs
+		}
+	}
+
+	if max > 1.0 {
+		scale := 1.0 / max
+		for i := range buf {
+			buf[i] *= float32(scale)
+		}
+	}
+}
+
 func initAudio() (*AudioBuffer, error) {
 	encoder, err := opus.NewEncoder(sampleRate, channels, opus.AppVoIP)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create encoder: %v", err)
 	}
 
-	// Настраиваем параметры кодека для лучшего качества
-	encoder.SetBitrate(96000)     // 64 kbps для лучшего качества голоса
-	encoder.SetComplexity(10)     // Максимальное качество кодирования
+	// Оптимальные настройки для голосового чата
+	encoder.SetBitrate(32000)     // 32 kbps для голоса
+	encoder.SetComplexity(8)      // Баланс между качеством и нагрузкой
 	encoder.SetInBandFEC(true)    // Включаем коррекцию ошибок
-	encoder.SetPacketLossPerc(10) // Ожидаем 10% потерь пакетов
+	encoder.SetPacketLossPerc(30) // Агрессивная коррекция ошибок
 
 	decoder, err := opus.NewDecoder(sampleRate, channels)
 	if err != nil {
@@ -114,10 +291,15 @@ func initAudio() (*AudioBuffer, error) {
 		OpusOutputBuf: make([]int16, frameSize),
 		Encoder:       encoder,
 		Decoder:       decoder,
+		JitterBuffer:  make([][]float32, 0, jitterBufferSize),
 	}, nil
 }
 
 func startAudioStream(conn *net.UDPConn, buffer *AudioBuffer) error {
+	// Увеличиваем буферы UDP
+	conn.SetWriteBuffer(32768) // Увеличиваем буфер отправки
+	conn.SetReadBuffer(32768)  // Увеличиваем буфер приема
+
 	audioState := &AudioState{
 		buffer:      buffer,
 		lastLogTime: time.Now(),
@@ -125,36 +307,19 @@ func startAudioStream(conn *net.UDPConn, buffer *AudioBuffer) error {
 
 	// Проверяем UDP соединение
 	remoteAddr := conn.RemoteAddr().(*net.UDPAddr)
-	fmt.Printf("Установлено голосовое соединение с %s\n", remoteAddr.String())
+	fmt.Printf("Голосовое соединение установлено с %s\n", remoteAddr.String())
 
-	fmt.Println("Инициализация аудио потоков...")
-
-	// Получаем информацию о доступных устройствах
-	devices, err := portaudio.Devices()
-	if err != nil {
-		return fmt.Errorf("не удалось получить список аудио устройств: %v", err)
-	}
-
-	// Выводим информацию об устройствах
-	fmt.Println("\nДоступные аудио устройства:")
-	for _, dev := range devices {
-		if dev.MaxOutputChannels > 0 {
-			fmt.Printf("Выход: %s (задержка: %v)\n", dev.Name, dev.DefaultLowOutputLatency)
-		}
-		if dev.MaxInputChannels > 0 {
-			fmt.Printf("Вход: %s (задержка: %v)\n", dev.Name, dev.DefaultLowInputLatency)
-		}
-	}
+	fmt.Println("Инициализация аудиопотоков...")
 
 	defaultOutputDevice, err := portaudio.DefaultOutputDevice()
 	if err != nil {
-		return fmt.Errorf("не удалось получить устройство вывода по умолчанию: %v", err)
+		return fmt.Errorf("ошибка получения устройства вывода по умолчанию: %v", err)
 	}
-	fmt.Printf("\nИспользуется устройство вывода: %s\n", defaultOutputDevice.Name)
+	fmt.Printf("Используется устройство вывода: %s\n", defaultOutputDevice.Name)
 
 	defaultInputDevice, err := portaudio.DefaultInputDevice()
 	if err != nil {
-		return fmt.Errorf("не удалось получить устройство ввода по умолчанию: %v", err)
+		return fmt.Errorf("ошибка получения устройства ввода по умолчанию: %v", err)
 	}
 	fmt.Printf("Используется устройство ввода: %s\n", defaultInputDevice.Name)
 
@@ -191,26 +356,11 @@ func startAudioStream(conn *net.UDPConn, buffer *AudioBuffer) error {
 		FramesPerBuffer: frameSize,
 	}
 
-	// Проверяем поддержку формата
-	err = portaudio.IsFormatSupported(outputStreamParams, buffer.OutputBuffer)
-	if err != nil {
-		fmt.Printf("❌ Формат аудио не поддерживается: %v\n", err)
-		return fmt.Errorf("unsupported audio format: %v", err)
-	}
-	fmt.Println("✅ Формат аудио поддерживается")
-
 	audioState.outputStream, err = portaudio.OpenStream(outputStreamParams, buffer.OutputBuffer)
 	if err != nil {
 		audioState.inputStream.Close()
 		return fmt.Errorf("failed to open output stream: %v", err)
 	}
-	fmt.Printf("✅ Выходной поток успешно открыт (устройство: %s)\n", defaultOutputDevice.Name)
-
-	// Проверяем информацию о потоке
-	streamInfo := audioState.outputStream.Info()
-	fmt.Printf("ℹ️ Информация о потоке:\n")
-	fmt.Printf("   Выходная задержка: %v\n", streamInfo.OutputLatency)
-	fmt.Printf("   Частота дискретизации: %.0f Гц\n", streamInfo.SampleRate)
 
 	if err := audioState.inputStream.Start(); err != nil {
 		audioState.inputStream.Close()
@@ -225,290 +375,136 @@ func startAudioStream(conn *net.UDPConn, buffer *AudioBuffer) error {
 		return fmt.Errorf("failed to start output stream: %v", err)
 	}
 
-	fmt.Println("✅ Выходной поток успешно запущен")
+	fmt.Println("✅ Аудиопотоки инициализированы")
 
-	// Проверяем загрузку CPU
-	time.Sleep(100 * time.Millisecond) // Даем потоку время инициализироваться
-	cpuLoad := audioState.outputStream.CpuLoad()
-	fmt.Printf("ℹ️ Загрузка CPU потоком: %.1f%%\n", cpuLoad*100)
+	// Инициализируем аудио процессор и джиттер буфер
+	processor := NewAudioProcessor()
+	jitterBuffer := NewJitterBuffer(jitterBufferSize, frameSize)
 
-	// Воспроизводим тестовый звук с нарастающей громкостью
-	fmt.Println("Воспроизведение тестового звука...")
-	for i := range buffer.OutputBuffer {
-		t := float64(i) / float64(sampleRate)
-		amplitude := float32(0.5 * (1.0 - math.Exp(-t*5.0))) // Плавное нарастание громкости
-		buffer.OutputBuffer[i] = amplitude * float32(math.Sin(2.0*math.Pi*440.0*t))
-	}
-
-	// Проверяем содержимое буфера перед воспроизведением
-	maxAmplitude := float32(0)
-	for _, sample := range buffer.OutputBuffer {
-		amplitude := float32(math.Abs(float64(sample)))
-		if amplitude > maxAmplitude {
-			maxAmplitude = amplitude
-		}
-	}
-	fmt.Printf("Максимальная амплитуда тестового сигнала: %.4f\n", maxAmplitude)
-
-	err = audioState.outputStream.Write()
-	if err != nil {
-		fmt.Printf("Ошибка воспроизведения тестового звука: %v\n", err)
-	} else {
-		fmt.Println("Тестовый звук отправлен на воспроизведение")
-	}
-
-	// Даем время на воспроизведение тестового звука
-	time.Sleep(500 * time.Millisecond)
-
-	// Буфер для закодированных данных
-	encodedData := make([]byte, maxBytes)
-
-	// Запускаем горутину для записи звука
+	// Модифицируем горутину записи
 	audioWg.Add(1)
 	go func() {
 		defer audioWg.Done()
 		defer audioState.inputStream.Stop()
 		defer audioState.inputStream.Close()
 
-		fmt.Println("Запущена горутина записи звука")
-		var lastPrintTime time.Time
-		sampleCount := 0
-		bytesSent := 0
+		inputAccumulator := make([]float32, 0, frameSize*inputBufferMultiplier)
+		encodedData := make([]byte, maxBytes)
 
 		for {
 			select {
 			case <-stopAudio:
-				fmt.Println("Остановка записи звука")
 				return
 			default:
-				// Читаем звук с микрофона
 				err := audioState.inputStream.Read()
 				if err != nil {
-					fmt.Printf("Error reading from input stream: %v\n", err)
+					time.Sleep(10 * time.Millisecond)
 					continue
 				}
 
-				// Проверяем, есть ли звук в буфере
-				hasSound := false
-				maxInputAmplitude := float32(0)
-				for _, sample := range buffer.InputBuffer {
-					amplitude := float32(math.Abs(float64(sample)))
-					if amplitude > maxInputAmplitude {
-						maxInputAmplitude = amplitude
-					}
-					if amplitude > 0.01 {
-						hasSound = true
+				// Накапливаем данные
+				inputAccumulator = append(inputAccumulator, buffer.InputBuffer...)
+
+				// Обрабатываем только если накопили достаточно данных
+				for len(inputAccumulator) >= frameSize {
+					// Копируем frameSize сэмплов
+					copy(buffer.InputBuffer, inputAccumulator[:frameSize])
+
+					// Сдвигаем буфер
+					inputAccumulator = append(inputAccumulator[:0], inputAccumulator[frameSize:]...)
+
+					// Обрабатываем входной звук
+					processed := processor.ProcessInput(buffer.InputBuffer)
+
+					// Конвертируем и кодируем
+					opusData := float32ToInt16(processed)
+					n, err := buffer.Encoder.Encode(opusData, encodedData)
+					if err == nil && n > 0 && n <= maxBytes {
+						conn.Write(encodedData[:n])
 					}
 				}
 
-				// Усиливаем входной сигнал если он слишком тихий
-				if maxInputAmplitude > 0 && maxInputAmplitude < 0.1 {
-					gain := 0.3 / maxInputAmplitude
-					if gain > 10.0 {
-						gain = 10.0
-					}
-					for i := range buffer.InputBuffer {
-						buffer.InputBuffer[i] *= gain
-					}
-				}
-
-				if hasSound {
-					sampleCount++
-					// Конвертируем float32 в int16 для Opus
-					buffer.OpusInputBuf = float32ToInt16(buffer.InputBuffer)
-
-					// Кодируем звук
-					n, err := buffer.Encoder.Encode(buffer.OpusInputBuf, encodedData)
-					if err != nil {
-						fmt.Printf("Error encoding audio: %v\n", err)
-						continue
-					}
-
-					// Отправляем закодированные данные
-					bytesWritten, err := conn.Write(encodedData[:n])
-					if err != nil {
-						fmt.Printf("Error sending audio data: %v\n", err)
-						continue
-					}
-					bytesSent += bytesWritten
-
-					if time.Since(lastPrintTime) > time.Second {
-						fmt.Printf("Записано %d сэмплов с звуком (макс. амплитуда: %.4f), отправлено %d байт за последнюю секунду\n",
-							sampleCount, maxInputAmplitude, bytesSent)
-						sampleCount = 0
-						bytesSent = 0
-						lastPrintTime = time.Now()
-					}
-				}
+				time.Sleep(5 * time.Millisecond)
 			}
 		}
 	}()
 
-	// Запускаем горутину для воспроизведения звука
+	// Добавляем горутину для отправки heartbeat
+	audioWg.Add(1)
+	go func() {
+		defer audioWg.Done()
+		ticker := time.NewTicker(1 * time.Second)
+		defer ticker.Stop()
+
+		heartbeat := []byte{0}
+		for {
+			select {
+			case <-stopAudio:
+				return
+			case <-ticker.C:
+				conn.Write(heartbeat)
+			}
+		}
+	}()
+
+	// Модифицируем горутину воспроизведения
 	audioWg.Add(1)
 	go func() {
 		defer audioWg.Done()
 		defer audioState.outputStream.Stop()
 		defer audioState.outputStream.Close()
 
-		fmt.Println("Запущена горутина воспроизведения звука")
-
 		receiveBuf := make([]byte, maxBytes)
+
 		for {
 			select {
 			case <-stopAudio:
-				fmt.Println("Остановка воспроизведения звука")
 				return
 			default:
-				// Устанавливаем таймаут чтения
-				conn.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
-
-				// Получаем звуковые данные
+				conn.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
 				n, _, err := conn.ReadFromUDP(receiveBuf)
 				if err != nil {
 					if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
 						continue
 					}
-					fmt.Printf("Error receiving audio data: %v\n", err)
 					continue
 				}
 
-				fmt.Printf("Получен UDP-пакет размером %d байт\n", n)
-
-				audioState.packetsReceived++
-				audioState.bytesReceived += int64(n)
+				// Пропускаем heartbeat пакеты
+				if n == 1 && receiveBuf[0] == 0 {
+					continue
+				}
 
 				// Декодируем полученные данные
 				samplesRead, err := buffer.Decoder.Decode(receiveBuf[:n], buffer.OpusOutputBuf)
-				if err != nil {
-					fmt.Printf("❌ Ошибка декодирования: %v\n", err)
+				if err != nil || samplesRead != frameSize {
 					continue
 				}
 
-				audioState.samplesDecoded += samplesRead
+				// Конвертируем в float32
+				audioFloat := int16ToFloat32(buffer.OpusOutputBuf)
 
-				if samplesRead == 0 {
-					continue
-				}
+				// Обрабатываем выходной звук
+				processed := processor.ProcessInput(audioFloat)
 
-				// Проверяем размер буфера
-				if samplesRead > len(buffer.OutputBuffer) {
-					fmt.Printf("⚠️ Количество декодированных сэмплов (%d) больше размера буфера (%d)\n",
-						samplesRead, len(buffer.OutputBuffer))
-					samplesRead = len(buffer.OutputBuffer)
-				}
+				// Добавляем в джиттер буфер
+				jitterBuffer.Add(processed)
 
-				// Конвертируем int16 в float32 для PortAudio
-				outputFloat32 := int16ToFloat32(buffer.OpusOutputBuf[:samplesRead])
-				// Копируем данные в выходной буфер с проверкой размера
-				copy(buffer.OutputBuffer, outputFloat32)
-				// Очищаем оставшуюся часть буфера
-				for i := samplesRead; i < len(buffer.OutputBuffer); i++ {
-					buffer.OutputBuffer[i] = 0
-				}
+				// Воспроизводим только если есть достаточно данных в джиттер-буфере
+				if jitterBuffer.Available() >= minBufferThreshold {
+					// Получаем следующий фрейм из джиттер буфера
+					playbackData := jitterBuffer.Get()
 
-				// Проверяем наличие звука в буфере
-				hasSound := false
-				maxAmplitude := float32(0)
-				sumAmplitude := float32(0)
-				for _, sample := range buffer.OutputBuffer[:samplesRead] {
-					amplitude := float32(math.Abs(float64(sample)))
-					sumAmplitude += amplitude
-					if amplitude > maxAmplitude {
-						maxAmplitude = amplitude
+					// Копируем в выходной буфер PortAudio
+					copy(buffer.OutputBuffer, playbackData)
+
+					// Воспроизводим
+					err = audioState.outputStream.Write()
+					if err != nil {
+						// Можно добавить логирование ошибки записи, если это происходит часто
+						// log.Printf("Ошибка записи в аудиопоток: %v", err)
+						continue
 					}
-					if amplitude > 0.01 {
-						hasSound = true
-					}
-				}
-
-				// Более плавная обработка сигнала
-				if hasSound && maxAmplitude > 0 {
-					// Адаптивное усиление с плавным переходом
-					targetGain := float64(1.0)
-					if maxAmplitude < 0.3 {
-						targetGain = math.Min(float64(0.3/maxAmplitude), 2.0)
-					}
-
-					// Применяем усиление с плавным переходом
-					for i := range buffer.OutputBuffer[:samplesRead] {
-						// Нормализуем сигнал более мягко
-						sample := float64(buffer.OutputBuffer[i])
-						if math.Abs(sample) > 0.001 { // Игнорируем очень тихие сигналы
-							sample *= targetGain
-							// Мягкое ограничение амплитуды
-							if sample > 0.95 {
-								sample = 0.95 + math.Tanh(sample-0.95)*0.05
-							} else if sample < -0.95 {
-								sample = -0.95 + math.Tanh(sample+0.95)*0.05
-							}
-						}
-						buffer.OutputBuffer[i] = float32(sample)
-					}
-
-					if debugMode {
-						fmt.Printf("Применено усиление %.2fx (макс. амплитуда: %.4f)\n", targetGain, maxAmplitude)
-					}
-				}
-
-				// Проверяем доступность буфера для записи
-				available, err := audioState.outputStream.AvailableToWrite()
-				if err != nil {
-					fmt.Printf("❌ Ошибка проверки доступности буфера: %v\n", err)
-					continue
-				}
-
-				if available < len(buffer.OutputBuffer) {
-					fmt.Printf("⚠️ Буфер заполнен (доступно %d из %d)\n", available, len(buffer.OutputBuffer))
-					time.Sleep(10 * time.Millisecond) // Даем время на освобождение буфера
-					continue
-				}
-
-				// Проверяем состояние потока перед записью
-				streamInfo := audioState.outputStream.Info()
-				if streamInfo.OutputLatency > 200*time.Millisecond {
-					fmt.Printf("⚠️ Высокая задержка вывода: %v\n", streamInfo.OutputLatency)
-				}
-
-				// Воспроизводим звук
-				err = audioState.outputStream.Write()
-				if err != nil {
-					fmt.Printf("❌ Ошибка записи в выходной поток: %v\n", err)
-					continue
-				}
-
-				if hasSound {
-					audioState.samplesPlayed++
-					fmt.Printf("🔊 Воспроизведение: макс. амплитуда=%.4f, средняя=%.4f, задержка=%v\n",
-						maxAmplitude, sumAmplitude/float32(len(buffer.OutputBuffer)), streamInfo.OutputLatency)
-				}
-
-				// Логируем статистику каждые 5 секунд
-				if time.Since(audioState.lastLogTime) > 5*time.Second {
-					kbps := float64(audioState.bytesReceived) * 8 / 1024 / 5 // КБит/с за 5 секунд
-					fmt.Printf("\n📊 Статистика за 5 секунд:\n")
-					fmt.Printf("   Получено пакетов: %d (%.1f пак/с)\n",
-						audioState.packetsReceived, float64(audioState.packetsReceived)/5)
-					fmt.Printf("   Скорость приема: %.1f КБит/с\n", kbps)
-					fmt.Printf("   Декодировано сэмплов: %d\n", audioState.samplesDecoded)
-					fmt.Printf("   Воспроизведено сэмплов: %d\n", audioState.samplesPlayed)
-					fmt.Printf("   Максимальная амплитуда: %.4f\n", maxAmplitude)
-
-					if cpuLoad := audioState.outputStream.CpuLoad(); cpuLoad > 0.1 {
-						fmt.Printf("   Загрузка CPU: %.1f%%\n", cpuLoad*100)
-					}
-
-					// Проверяем состояние потока
-					fmt.Printf("   Состояние потока:\n")
-					fmt.Printf("      Выходная задержка: %v\n", streamInfo.OutputLatency)
-					fmt.Printf("      Частота дискретизации: %.0f Гц\n", streamInfo.SampleRate)
-					fmt.Printf("      Доступно для записи: %d сэмплов\n", available)
-
-					audioState.packetsReceived = 0
-					audioState.bytesReceived = 0
-					audioState.samplesDecoded = 0
-					audioState.samplesPlayed = 0
-					audioState.lastLogTime = time.Now()
 				}
 			}
 		}
