@@ -23,11 +23,11 @@ const (
 	noiseThreshold   = 0.02 // Порог шумоподавления (возможно, стоит также пересмотреть)
 
 	// Константы обработки аудио
-	vadThreshold         = 0.005 // Порог определения голосовой активности
-	softGateFactor       = 0.1   // Коэффициент ослабления для мягкого гейта
+	vadThreshold         = 0.002 // Порог определения голосовой активности (было 0.005)
+	softGateFactor       = 0.3   // Коэффициент ослабления для мягкого гейта (было 0.1)
 	gainFactor           = 1.2   // Небольшое усиление для слабых сигналов
 	compressionThreshold = 0.8   // Порог для компрессии динамического диапазона
-	vadHangoverTimeMs    = 150   // Время удержания VAD в миллисекундах
+	vadHangoverTimeMs    = 250   // Время удержания VAD в миллисекундах (было 150)
 
 	// Константы буферизации
 	inputBufferMultiplier = 3 // Размер входного буфера относительно frameSize
@@ -35,25 +35,15 @@ const (
 )
 
 var (
-	voiceConn     *net.UDPConn
-	stopAudio     chan struct{}
-	audioWg       sync.WaitGroup
-	paInitialized bool = false
-
-	// Вычисляем количество кадров для удержания VAD
-	// Длительность одного фрейма = frameSize / sampleRate = 960 / 48000 = 0.02 сек = 20 мс
-	vadHangoverFrames = vadHangoverTimeMs / 20
+	paInitialized     bool = false
+	vadHangoverFrames      = vadHangoverTimeMs / 20
 )
 
 type AudioState struct {
-	inputStream     *portaudio.Stream
-	outputStream    *portaudio.Stream
-	buffer          *AudioBuffer
-	lastLogTime     time.Time
-	packetsReceived int
-	bytesReceived   int64
-	samplesDecoded  int
-	samplesPlayed   int
+	inputStream  *portaudio.Stream
+	outputStream *portaudio.Stream
+	buffer       *AudioBuffer
+	lastLogTime  time.Time
 }
 
 type AudioBuffer struct {
@@ -63,7 +53,7 @@ type AudioBuffer struct {
 	OpusOutputBuf []int16
 	Encoder       *opus.Encoder
 	Decoder       *opus.Decoder
-	JitterBuffer  [][]float32 // Буфер для сглаживания воспроизведения
+	JitterBuffer  [][]float32
 }
 
 // JitterBuffer управляет временем пакетов аудио
@@ -85,28 +75,20 @@ func NewJitterBuffer(size int, frameSize int) *JitterBuffer {
 func (jb *JitterBuffer) Add(data []float32) {
 	jb.mutex.Lock()
 	defer jb.mutex.Unlock()
-
 	if len(jb.buffer) >= jb.maxSize {
-		// Буфер полон, удаляем самый старый фрейм
 		jb.buffer = jb.buffer[1:]
 	}
-
-	// Создаем копию данных
 	frame := make([]float32, len(data))
 	copy(frame, data)
-
 	jb.buffer = append(jb.buffer, frame)
 }
 
 func (jb *JitterBuffer) Get() []float32 {
 	jb.mutex.Lock()
 	defer jb.mutex.Unlock()
-
 	if len(jb.buffer) == 0 {
-		return make([]float32, jb.frameSize) // Возвращаем тишину если буфер пуст
+		return make([]float32, jb.frameSize)
 	}
-
-	// Получаем самый старый фрейм
 	frame := jb.buffer[0]
 	jb.buffer = jb.buffer[1:]
 	return frame
@@ -125,8 +107,8 @@ type AudioProcessor struct {
 	energyThreshold      float32
 	smoothingFactor      float32
 	noiseFloor           float32
-	framesSinceLastVoice int // Счетчик кадров с момента последнего обнаружения голоса
-	vadHangoverFrames    int // Количество кадров для удержания VAD
+	framesSinceLastVoice int
+	vadHangoverFrames    int
 }
 
 func NewAudioProcessor() *AudioProcessor {
@@ -136,59 +118,43 @@ func NewAudioProcessor() *AudioProcessor {
 		energyThreshold:      vadThreshold,
 		smoothingFactor:      0.95,
 		noiseFloor:           0.001,
-		framesSinceLastVoice: 0,                 // Инициализация счетчика
-		vadHangoverFrames:    vadHangoverFrames, // Инициализация из вычисленной глобальной переменной
+		framesSinceLastVoice: 0,
+		vadHangoverFrames:    vadHangoverFrames,
 	}
 }
 
 func (ap *AudioProcessor) ProcessInput(buffer []float32) []float32 {
-	// Создаем копию входного буфера
 	processed := make([]float32, len(buffer))
 	copy(processed, buffer)
-
-	// Вычисляем энергию сигнала
 	energy := float32(0)
 	for _, sample := range processed {
 		energy += sample * sample
 	}
 	energy /= float32(len(processed))
-
-	// Определение голосовой активности
 	if energy > ap.energyThreshold {
-		ap.framesSinceLastVoice = 0 // Голос есть, сбрасываем счетчик
+		ap.framesSinceLastVoice = 0
 	} else {
-		ap.framesSinceLastVoice++ // Голоса нет, увеличиваем счетчик
+		ap.framesSinceLastVoice++
 	}
-
-	// Мягкий гейт с учетом времени удержания
 	if ap.framesSinceLastVoice > ap.vadHangoverFrames {
 		for i := range processed {
-			processed[i] *= softGateFactor // Ослабляем сигнал, а не обнуляем
+			processed[i] *= softGateFactor
 		}
 		return processed
 	}
-
-	// Фильтр высоких частот (пропускаем только частоты выше определенного порога)
 	applyHighPassFilter(processed)
-
-	// Динамическая компрессия диапазона (уменьшение разницы между самыми тихими и громкими звуками)
 	ap.applyCompression(processed)
-
-	// Финальная нормализация амплитуды (приведение громкости к стандартному уровню)
 	normalizeAmplitude(processed)
-
 	return processed
 }
 
 func (ap *AudioProcessor) applyCompression(buffer []float32) {
-	// Find peak amplitude
 	peak := float32(0)
 	for _, sample := range buffer {
 		if abs := float32(math.Abs(float64(sample))); abs > peak {
 			peak = abs
 		}
 	}
-
 	if peak > compressionThreshold {
 		ratio := compressionThreshold / peak
 		for i := range buffer {
@@ -200,7 +166,6 @@ func (ap *AudioProcessor) applyCompression(buffer []float32) {
 func float32ToInt16(float32Buf []float32) []int16 {
 	int16Buf := make([]int16, len(float32Buf))
 	for i, f := range float32Buf {
-		// Convert float32 [-1.0,1.0] to int16
 		s := f * 32767.0
 		if s > 32767.0 {
 			s = 32767.0
@@ -215,7 +180,6 @@ func float32ToInt16(float32Buf []float32) []int16 {
 func int16ToFloat32(int16Buf []int16) []float32 {
 	float32Buf := make([]float32, len(int16Buf))
 	for i, s := range int16Buf {
-		// Convert int16 to float32 [-1.0,1.0]
 		float32Buf[i] = float32(s) / 32767.0
 	}
 	return float32Buf
@@ -238,9 +202,8 @@ func terminatePortAudio() {
 	}
 }
 
-// Функция для фильтрации низких частот
 func applyHighPassFilter(buf []float32) {
-	rc := 1.0 / (2 * math.Pi * 100.0) // Частота среза 100 Гц
+	rc := 1.0 / (2 * math.Pi * 100.0)
 	dt := 1.0 / float64(sampleRate)
 	alpha := float32(rc / (rc + dt))
 	prev := float32(0)
@@ -250,7 +213,6 @@ func applyHighPassFilter(buf []float32) {
 	}
 }
 
-// Функция для нормализации амплитуды
 func normalizeAmplitude(buf []float32) {
 	max := float32(0)
 	for _, s := range buf {
@@ -258,11 +220,23 @@ func normalizeAmplitude(buf []float32) {
 			max = abs
 		}
 	}
-
-	if max > 1.0 {
-		scale := 1.0 / max
-		for i := range buf {
-			buf[i] *= float32(scale)
+	targetMinPeak := float32(0.2)
+	targetMaxPeak := float32(0.8)
+	maxBoostFactor := float32(2.5)
+	if max > 0.0001 {
+		if max < targetMinPeak {
+			scale := targetMinPeak / max
+			if scale > maxBoostFactor {
+				scale = maxBoostFactor
+			}
+			for i := range buf {
+				buf[i] *= scale
+			}
+		} else if max > targetMaxPeak {
+			scale := targetMaxPeak / max
+			for i := range buf {
+				buf[i] *= scale
+			}
 		}
 	}
 }
@@ -272,18 +246,14 @@ func initAudio() (*AudioBuffer, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to create encoder: %v", err)
 	}
-
-	// Оптимальные настройки для голосового чата
-	encoder.SetBitrate(32000)     // 32 kbps для голоса
-	encoder.SetComplexity(8)      // Баланс между качеством и нагрузкой
-	encoder.SetInBandFEC(true)    // Включаем коррекцию ошибок
-	encoder.SetPacketLossPerc(30) // Агрессивная коррекция ошибок
-
+	encoder.SetBitrate(32000)
+	encoder.SetComplexity(8)
+	encoder.SetInBandFEC(true)
+	encoder.SetPacketLossPerc(30)
 	decoder, err := opus.NewDecoder(sampleRate, channels)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create decoder: %v", err)
 	}
-
 	return &AudioBuffer{
 		InputBuffer:   make([]float32, frameSize),
 		OutputBuffer:  make([]float32, frameSize),
@@ -295,35 +265,26 @@ func initAudio() (*AudioBuffer, error) {
 	}, nil
 }
 
-func startAudioStream(conn *net.UDPConn, buffer *AudioBuffer) error {
-	// Увеличиваем буферы UDP
-	conn.SetWriteBuffer(32768) // Увеличиваем буфер отправки
-	conn.SetReadBuffer(32768)  // Увеличиваем буфер приема
-
+func startAudioStream(conn *net.UDPConn, buffer *AudioBuffer, stopCh chan struct{}, wg *sync.WaitGroup) error {
+	conn.SetWriteBuffer(32768)
+	conn.SetReadBuffer(32768)
 	audioState := &AudioState{
 		buffer:      buffer,
 		lastLogTime: time.Now(),
 	}
-
-	// Проверяем UDP соединение
 	remoteAddr := conn.RemoteAddr().(*net.UDPAddr)
 	fmt.Printf("Голосовое соединение установлено с %s\n", remoteAddr.String())
-
 	fmt.Println("Инициализация аудиопотоков...")
-
 	defaultOutputDevice, err := portaudio.DefaultOutputDevice()
 	if err != nil {
 		return fmt.Errorf("ошибка получения устройства вывода по умолчанию: %v", err)
 	}
 	fmt.Printf("Используется устройство вывода: %s\n", defaultOutputDevice.Name)
-
 	defaultInputDevice, err := portaudio.DefaultInputDevice()
 	if err != nil {
 		return fmt.Errorf("ошибка получения устройства ввода по умолчанию: %v", err)
 	}
 	fmt.Printf("Используется устройство ввода: %s\n", defaultInputDevice.Name)
-
-	// Открываем входной поток (микрофон)
 	inputStreamParams := portaudio.StreamParameters{
 		Input: portaudio.StreamDeviceParameters{
 			Device:   defaultInputDevice,
@@ -336,13 +297,10 @@ func startAudioStream(conn *net.UDPConn, buffer *AudioBuffer) error {
 		SampleRate:      float64(sampleRate),
 		FramesPerBuffer: frameSize,
 	}
-
 	audioState.inputStream, err = portaudio.OpenStream(inputStreamParams, buffer.InputBuffer)
 	if err != nil {
 		return fmt.Errorf("failed to open input stream: %v", err)
 	}
-
-	// Открываем выходной поток (динамики)
 	outputStreamParams := portaudio.StreamParameters{
 		Input: portaudio.StreamDeviceParameters{
 			Channels: 0,
@@ -355,45 +313,35 @@ func startAudioStream(conn *net.UDPConn, buffer *AudioBuffer) error {
 		SampleRate:      float64(sampleRate),
 		FramesPerBuffer: frameSize,
 	}
-
 	audioState.outputStream, err = portaudio.OpenStream(outputStreamParams, buffer.OutputBuffer)
 	if err != nil {
 		audioState.inputStream.Close()
 		return fmt.Errorf("failed to open output stream: %v", err)
 	}
-
 	if err := audioState.inputStream.Start(); err != nil {
 		audioState.inputStream.Close()
 		audioState.outputStream.Close()
 		return fmt.Errorf("failed to start input stream: %v", err)
 	}
-
 	if err := audioState.outputStream.Start(); err != nil {
 		audioState.inputStream.Stop()
 		audioState.inputStream.Close()
 		audioState.outputStream.Close()
 		return fmt.Errorf("failed to start output stream: %v", err)
 	}
-
 	fmt.Println("✅ Аудиопотоки инициализированы")
-
-	// Инициализируем аудио процессор и джиттер буфер
 	processor := NewAudioProcessor()
 	jitterBuffer := NewJitterBuffer(jitterBufferSize, frameSize)
-
-	// Модифицируем горутину записи
-	audioWg.Add(1)
+	wg.Add(1)
 	go func() {
-		defer audioWg.Done()
+		defer wg.Done()
 		defer audioState.inputStream.Stop()
 		defer audioState.inputStream.Close()
-
 		inputAccumulator := make([]float32, 0, frameSize*inputBufferMultiplier)
 		encodedData := make([]byte, maxBytes)
-
 		for {
 			select {
-			case <-stopAudio:
+			case <-stopCh:
 				return
 			default:
 				err := audioState.inputStream.Read()
@@ -401,64 +349,45 @@ func startAudioStream(conn *net.UDPConn, buffer *AudioBuffer) error {
 					time.Sleep(10 * time.Millisecond)
 					continue
 				}
-
-				// Накапливаем данные
 				inputAccumulator = append(inputAccumulator, buffer.InputBuffer...)
-
-				// Обрабатываем только если накопили достаточно данных
 				for len(inputAccumulator) >= frameSize {
-					// Копируем frameSize сэмплов
 					copy(buffer.InputBuffer, inputAccumulator[:frameSize])
-
-					// Сдвигаем буфер
 					inputAccumulator = append(inputAccumulator[:0], inputAccumulator[frameSize:]...)
-
-					// Обрабатываем входной звук
 					processed := processor.ProcessInput(buffer.InputBuffer)
-
-					// Конвертируем и кодируем
 					opusData := float32ToInt16(processed)
 					n, err := buffer.Encoder.Encode(opusData, encodedData)
 					if err == nil && n > 0 && n <= maxBytes {
 						conn.Write(encodedData[:n])
 					}
 				}
-
 				time.Sleep(5 * time.Millisecond)
 			}
 		}
 	}()
-
-	// Добавляем горутину для отправки heartbeat
-	audioWg.Add(1)
+	wg.Add(1)
 	go func() {
-		defer audioWg.Done()
+		defer wg.Done()
 		ticker := time.NewTicker(1 * time.Second)
 		defer ticker.Stop()
-
 		heartbeat := []byte{0}
 		for {
 			select {
-			case <-stopAudio:
+			case <-stopCh:
 				return
 			case <-ticker.C:
 				conn.Write(heartbeat)
 			}
 		}
 	}()
-
-	// Модифицируем горутину воспроизведения
-	audioWg.Add(1)
+	wg.Add(1)
 	go func() {
-		defer audioWg.Done()
+		defer wg.Done()
 		defer audioState.outputStream.Stop()
 		defer audioState.outputStream.Close()
-
 		receiveBuf := make([]byte, maxBytes)
-
 		for {
 			select {
-			case <-stopAudio:
+			case <-stopCh:
 				return
 			default:
 				conn.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
@@ -469,85 +398,183 @@ func startAudioStream(conn *net.UDPConn, buffer *AudioBuffer) error {
 					}
 					continue
 				}
-
-				// Пропускаем heartbeat пакеты
 				if n == 1 && receiveBuf[0] == 0 {
 					continue
 				}
-
-				// Декодируем полученные данные
 				samplesRead, err := buffer.Decoder.Decode(receiveBuf[:n], buffer.OpusOutputBuf)
 				if err != nil || samplesRead != frameSize {
 					continue
 				}
-
-				// Конвертируем в float32
 				audioFloat := int16ToFloat32(buffer.OpusOutputBuf)
-
-				// Обрабатываем выходной звук
 				processed := processor.ProcessInput(audioFloat)
-
-				// Добавляем в джиттер буфер
 				jitterBuffer.Add(processed)
-
-				// Воспроизводим только если есть достаточно данных в джиттер-буфере
 				if jitterBuffer.Available() >= minBufferThreshold {
-					// Получаем следующий фрейм из джиттер буфера
 					playbackData := jitterBuffer.Get()
-
-					// Копируем в выходной буфер PortAudio
 					copy(buffer.OutputBuffer, playbackData)
-
-					// Воспроизводим
 					err = audioState.outputStream.Write()
 					if err != nil {
-						// Можно добавить логирование ошибки записи, если это происходит часто
-						// log.Printf("Ошибка записи в аудиопоток: %v", err)
 						continue
 					}
 				}
 			}
 		}
 	}()
-
 	return nil
 }
 
+type AppController struct {
+	serverIP        string
+	username        string // Будет установлен после успешного LOGIN_SUCCESS
+	password        string // Для отправки на сервер
+	mainConn        *net.UDPConn
+	voiceConn       *net.UDPConn
+	stopAudio       chan struct{}
+	audioWg         sync.WaitGroup
+	isAuthenticated bool      // Флаг успешной аутентификации
+	exitSignal      chan bool // Канал для сигнала о завершении из горутины чтения
+}
+
+func NewAppController(serverIP, username, password string, mainConn *net.UDPConn) *AppController {
+	return &AppController{
+		serverIP:        serverIP,
+		username:        username, // Изначально используется для LOGIN
+		password:        password,
+		mainConn:        mainConn,
+		isAuthenticated: false,
+		exitSignal:      make(chan bool, 1),
+	}
+}
+
+func (ac *AppController) Authenticate() bool {
+	loginMessage := fmt.Sprintf("LOGIN::%s::%s", ac.username, ac.password)
+	_, err := ac.mainConn.Write([]byte(loginMessage))
+	if err != nil {
+		fmt.Printf("Ошибка отправки LOGIN: %v\n", err)
+		return false
+	}
+	// Ожидание ответа LOGIN_SUCCESS или LOGIN_FAILURE будет в основной горутине чтения
+	// Здесь мы просто отправляем запрос. Флаг isAuthenticated установится в main.
+	return true // Возвращаем true, если отправка успешна, а не аутентификация
+}
+
+func (ac *AppController) HandleVoiceCommand() {
+	if !ac.isAuthenticated {
+		fmt.Println("Необходимо сначала успешно войти в чат для использования голосовых команд.")
+		return
+	}
+	if ac.voiceConn == nil {
+		if !paInitialized {
+			if err := initPortAudio(); err != nil {
+				fmt.Printf("Ошибка инициализации PortAudio: %v\n", err)
+				return
+			}
+		}
+		voiceAddr, err := net.ResolveUDPAddr("udp", ac.serverIP+":6001")
+		if err != nil {
+			fmt.Println("Ошибка разрешения голосового адреса:", err)
+			return
+		}
+		ac.voiceConn, err = net.DialUDP("udp", nil, voiceAddr)
+		if err != nil {
+			fmt.Println("Ошибка подключения к голосовому чату:", err)
+			ac.voiceConn = nil
+			return
+		}
+		audioBuffer, err := initAudio()
+		if err != nil {
+			fmt.Printf("Ошибка инициализации аудио: %v\n", err)
+			ac.voiceConn.Close()
+			ac.voiceConn = nil
+			return
+		}
+		ac.stopAudio = make(chan struct{})
+		err = startAudioStream(ac.voiceConn, audioBuffer, ac.stopAudio, &ac.audioWg)
+		if err != nil {
+			fmt.Printf("Ошибка запуска аудио потока: %v\n", err)
+			ac.voiceConn.Close()
+			ac.voiceConn = nil
+			close(ac.stopAudio)
+			return
+		}
+		ac.mainConn.Write([]byte("VOICE_CONNECT"))
+		fmt.Println("Вы подключились к голосовому чату")
+	} else {
+		fmt.Println("Вы уже подключены к голосовому чату")
+	}
+}
+
+func (ac *AppController) HandleLeaveCommand() {
+	if !ac.isAuthenticated {
+		fmt.Println("Необходимо сначала успешно войти в чат.")
+		return
+	}
+	if ac.voiceConn != nil {
+		close(ac.stopAudio)
+		ac.audioWg.Wait()
+		ac.mainConn.Write([]byte("VOICE_DISCONNECT"))
+		ac.voiceConn.Close()
+		ac.voiceConn = nil
+		fmt.Println("Вы отключились от голосового чата")
+	} else {
+		fmt.Println("Вы не подключены к голосовому чату")
+	}
+}
+
+func (ac *AppController) HandleExitCommand() bool {
+	if ac.voiceConn != nil {
+		close(ac.stopAudio)
+		ac.audioWg.Wait()
+		// VOICE_DISCONNECT отправится автоматически при выходе, если сервер обрабатывает закрытие соединения
+		// ac.mainConn.Write([]byte("VOICE_DISCONNECT")) // Можно оставить для явности
+		ac.voiceConn.Close()
+		ac.voiceConn = nil
+	}
+	// Отправляем /exit только если мы аутентифицированы
+	// Если не аутентифицированы, просто выходим из клиента
+	if ac.isAuthenticated {
+		_, err := ac.mainConn.Write([]byte("/exit"))
+		if err != nil {
+			// fmt.Printf("Ошибка отправки /exit: %v\n", err) // Можно логировать, но все равно выходим
+		}
+	}
+	return true
+}
+
 func main() {
-	// Инициализируем PortAudio в начале программы
 	if err := initPortAudio(); err != nil {
 		fmt.Printf("Ошибка инициализации PortAudio: %v\n", err)
 		return
 	}
-	// Гарантируем завершение работы PortAudio при выходе
 	defer terminatePortAudio()
 
-	reader := bufio.NewReader(os.Stdin)
+	if len(os.Args) < 4 { // Ожидаем server_ip username password
+		fmt.Println("Использование: client.exe <server_ip> <username> <password>")
+		return
+	}
+	serverIP := os.Args[1]
+	username := os.Args[2]
+	password := os.Args[3] // Новый аргумент
 
-	// Запрашиваем IP сервера
-	fmt.Print("Введите IP сервера (или нажмите Enter для localhost): ")
-	serverIP, _ := reader.ReadString('\n')
-	serverIP = strings.TrimSpace(serverIP)
 	if serverIP == "" {
-		serverIP = "127.0.0.1"
+		fmt.Println("IP сервера не может быть пустым.")
+		return
+	}
+	if username == "" {
+		fmt.Println("Имя пользователя не может быть пустым.")
+		return
+	}
+	if password == "" {
+		fmt.Println("Пароль не может быть пустым.")
+		return
 	}
 
-	// Запрашиваем имя пользователя
-	fmt.Print("Введите ваше имя: ")
-	username, _ := reader.ReadString('\n')
-	username = strings.TrimSpace(username)
-	for username == "" {
-		fmt.Print("Имя не может быть пустым. Введите ваше имя: ")
-		username, _ = reader.ReadString('\n')
-		username = strings.TrimSpace(username)
-	}
+	fmt.Printf("Попытка подключения к серверу %s с именем %s...\n", serverIP, username)
 
 	serverAddr, err := net.ResolveUDPAddr("udp", serverIP+":6000")
 	if err != nil {
 		fmt.Println("Ошибка разрешения адреса:", err)
 		return
 	}
-
 	conn, err := net.DialUDP("udp", nil, serverAddr)
 	if err != nil {
 		fmt.Println("Ошибка подключения:", err)
@@ -555,123 +582,154 @@ func main() {
 	}
 	defer conn.Close()
 
-	// Отправляем сообщение о подключении
-	_, err = conn.Write([]byte(username + " joined the chat"))
-	if err != nil {
-		fmt.Println("Ошибка отправки:", err)
-		return
-	}
+	appController := NewAppController(serverIP, username, password, conn)
 
-	// Горутина для чтения входящих сообщений
+	// Горутина для чтения входящих сообщений от сервера
 	go func() {
 		buffer := make([]byte, 4096)
 		for {
 			n, _, err := conn.ReadFromUDP(buffer)
 			if err != nil {
-				fmt.Println("Ошибка чтения:", err)
+				// Если ошибка чтения, скорее всего соединение разорвано или сервер недоступен
+				if !appController.isAuthenticated {
+					fmt.Println("Не удалось подключиться к серверу или сервер отклонил соединение.")
+				} else {
+					// fmt.Println("Ошибка чтения с сервера:", err) // Можно раскомментировать для отладки
+				}
+				appController.exitSignal <- true // Сигнал для завершения main
 				return
 			}
-			fmt.Printf("\r%s\n> ", string(buffer[:n]))
+			serverMessage := string(buffer[:n])
+
+			if strings.HasPrefix(serverMessage, "LOGIN_SUCCESS::") {
+				parts := strings.SplitN(serverMessage, "::", 3)
+				if len(parts) == 3 {
+					// token := parts[1] // Токен пока не используется активно на клиенте, но можно сохранить
+					serverUsername := parts[2]
+					appController.username = serverUsername // Обновляем имя пользователя с тем, что прислал сервер
+					appController.isAuthenticated = true
+					fmt.Printf("Успешный вход как %s.\n", appController.username)
+					// После успешного логина выводим команды, как и раньше
+					fmt.Println("\nДоступные команды:")
+					fmt.Println("/voice - подключиться к голосовому чату")
+					fmt.Println("/leave - отключиться от голосового чата")
+					fmt.Println("/exit - выйти из чата")
+					fmt.Println("Любой другой текст будет отправлен как сообщение")
+					fmt.Print("> ")
+				}
+			} else if strings.HasPrefix(serverMessage, "LOGIN_FAILURE::") {
+				reason := strings.TrimPrefix(serverMessage, "LOGIN_FAILURE::")
+				fmt.Printf("Ошибка входа: %s\n", reason)
+				appController.exitSignal <- true // Сигнал для завершения main, так как вход не удался
+				return                           // Завершаем горутину чтения
+			} else if strings.HasPrefix(serverMessage, "ERROR::SESSION_INVALIDATED") {
+				fmt.Println("Ваша сессия была завершена, так как выполнен вход с этим именем пользователя с другого места.")
+				appController.exitSignal <- true // Сигнал для завершения main
+				return
+			} else if !appController.isAuthenticated {
+				// Если не аутентифицированы, но пришло что-то кроме LOGIN_*, это странно.
+				// Можно логировать или игнорировать.
+				// fmt.Printf("Получено сообщение до аутентификации: %s\n", serverMessage)
+				continue // Пропускаем, если не LOGIN_SUCCESS и не LOGIN_FAILURE
+			} else {
+				// Обработка сообщений после успешной аутентификации
+				if strings.HasPrefix(serverMessage, "USER_LIST::") {
+					jsonPart := strings.TrimPrefix(serverMessage, "USER_LIST::")
+					fmt.Printf("USER_LIST::%s\n", jsonPart)
+				} else if strings.HasPrefix(serverMessage, "STATUS_UPDATE::") {
+					// Формат SERVER_USER_STATUS_UPDATE::user::status был заменен на STATUS_UPDATE::user::status
+					// прямо из сервера, поэтому старый SERVER_USER_STATUS_UPDATE уже не нужен
+					fmt.Printf("%s\n", serverMessage) // Просто передаем как есть
+				} else if strings.HasPrefix(serverMessage, "SERVER_USER_JOINED::") { // Это сообщение больше не должно приходить, т.к. есть STATUS_UPDATE
+					userNameJoined := strings.TrimPrefix(serverMessage, "SERVER_USER_JOINED::")
+					fmt.Printf("STATUS_UPDATE::%s::online\n", userNameJoined)
+					fmt.Printf("%s joined the chat\n", userNameJoined)
+				} else if strings.HasPrefix(serverMessage, "SERVER_USER_LEFT::") { // Это сообщение больше не должно приходить
+					userNameLeft := strings.TrimPrefix(serverMessage, "SERVER_USER_LEFT::")
+					fmt.Printf("STATUS_UPDATE::%s::offline\n", userNameLeft)
+					fmt.Printf("%s left the chat\n", userNameLeft)
+				} else {
+					fmt.Printf("%s\n", serverMessage)
+				}
+			}
 		}
 	}()
 
-	fmt.Println("\nДоступные команды:")
-	fmt.Println("/voice - подключиться к голосовому чату")
-	fmt.Println("/leave - отключиться от голосового чата")
-	fmt.Println("/exit - выйти из чата")
-	fmt.Println("Любой другой текст будет отправлен как сообщение")
+	// Попытка аутентификации
+	if !appController.Authenticate() {
+		// Если отправка LOGIN сообщения не удалась, выходим
+		return
+	}
 
-	// Чтение ввода пользователя
-	fmt.Print("> ")
+	// Основной цикл для чтения ввода пользователя или ожидания сигнала на выход
 	scanner := bufio.NewScanner(os.Stdin)
-	for scanner.Scan() {
-		text := scanner.Text()
+	for {
+		// Используем select для неблокирующего чтения из Stdin и канала exitSignal
+		// Этот подход сложнее для простого консольного ввода, лучше использовать блокирующий Scan
+		// и прерывать его при получении сигнала.
 
-		switch text {
-		case "/voice":
-			if voiceConn == nil {
-				// Проверяем, что PortAudio инициализирован
-				if !paInitialized {
-					if err := initPortAudio(); err != nil {
-						fmt.Printf("Ошибка инициализации PortAudio: %v\n", err)
-						continue
-					}
-				}
+		// Канал для чтения строки из Stdin
+		inputLineChan := make(chan string)
+		scanErrChan := make(chan error)
 
-				// Подключаемся к голосовому чату
-				voiceAddr, err := net.ResolveUDPAddr("udp", serverIP+":6001")
-				if err != nil {
-					fmt.Println("Ошибка разрешения голосового адреса:", err)
-					continue
-				}
-				voiceConn, err = net.DialUDP("udp", nil, voiceAddr)
-				if err != nil {
-					fmt.Println("Ошибка подключения к голосовому чату:", err)
-					continue
-				}
-
-				// Инициализируем аудио
-				audioBuffer, err := initAudio()
-				if err != nil {
-					fmt.Printf("Ошибка инициализации аудио: %v\n", err)
-					voiceConn.Close()
-					voiceConn = nil
-					continue
-				}
-
-				// Создаем канал для остановки аудио
-				stopAudio = make(chan struct{})
-
-				// Запускаем аудио потоки
-				err = startAudioStream(voiceConn, audioBuffer)
-				if err != nil {
-					fmt.Printf("Ошибка запуска аудио потока: %v\n", err)
-					voiceConn.Close()
-					voiceConn = nil
-					continue
-				}
-
-				// Отправляем уведомление о подключении к голосовому чату
-				conn.Write([]byte("VOICE_CONNECT"))
-				fmt.Println("Вы подключились к голосовому чату")
+		go func() {
+			if scanner.Scan() {
+				inputLineChan <- scanner.Text()
 			} else {
-				fmt.Println("Вы уже подключены к голосовому чату")
+				scanErrChan <- scanner.Err()
+			}
+		}()
+
+		select {
+		case <-appController.exitSignal:
+			// fmt.Println("Получен сигнал на выход из приложения.")
+			return // Завершаем main
+
+		case text := <-inputLineChan:
+			if !appController.isAuthenticated {
+				// Если еще не аутентифицированы, то не даем отправлять команды,
+				// ждем ответа от сервера LOGIN_SUCCESS/FAILURE
+				// Это состояние не должно длиться долго.
+				// fmt.Print("> ") // Можно снова показать приглашение, если нужно
+				continue
 			}
 
-		case "/leave":
-			if voiceConn != nil {
-				// Останавливаем аудио потоки
-				close(stopAudio)
-				audioWg.Wait()
-
-				// Отправляем уведомление об отключении от голосового чата
-				conn.Write([]byte("VOICE_DISCONNECT"))
-				voiceConn.Close()
-				voiceConn = nil
-				fmt.Println("Вы отключились от голосового чата")
-			} else {
-				fmt.Println("Вы не подключены к голосовому чату")
+			shouldExit := false
+			switch text {
+			case "/voice":
+				appController.HandleVoiceCommand()
+			case "/leave":
+				appController.HandleLeaveCommand()
+			case "/exit":
+				shouldExit = appController.HandleExitCommand()
+			default:
+				// Отправляем обычное сообщение. Имя пользователя теперь берется из appController.username,
+				// которое было установлено сервером.
+				// Сервер сам добавит имя пользователя к сообщению, если это предусмотрено логикой сервера.
+				// Клиент просто отправляет текст.
+				// Для совместимости с текущим сервером, который ожидает "[username]: text" для обычных сообщений:
+				// Это можно убрать, если сервер будет сам форматировать сообщение от аутентифицированного юзера.
+				// Пока оставим, как было, но с ac.username
+				_, err := appController.mainConn.Write([]byte("[" + appController.username + "]: " + text))
+				if err != nil {
+					fmt.Println("Ошибка отправки:", err)
+					// shouldExit = true // Решаем, выходить ли при ошибке отправки
+				}
+			}
+			if shouldExit {
+				// fmt.Println("Завершение работы клиента по команде /exit...")
+				return // Завершаем main
+			}
+			if appController.isAuthenticated { // Показываем приглашение только после успешного входа
+				fmt.Print("> ")
 			}
 
-		case "/exit":
-			if voiceConn != nil {
-				// Останавливаем аудио потоки
-				close(stopAudio)
-				audioWg.Wait()
-
-				conn.Write([]byte("VOICE_DISCONNECT"))
-				voiceConn.Close()
-			}
-			return
-
-		default:
-			// Отправляем обычное сообщение
-			_, err := conn.Write([]byte("[" + username + "]: " + text))
+		case err := <-scanErrChan:
 			if err != nil {
-				fmt.Println("Ошибка отправки:", err)
-				return
+				// fmt.Printf("Ошибка сканирования ввода: %v\n", err)
 			}
+			// Если сканер завершился (например, EOF), то выходим
+			return // Завершаем main
 		}
-		fmt.Print("> ")
 	}
 }
