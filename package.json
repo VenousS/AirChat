@@ -37,7 +37,19 @@
           "bin/server.exe",
           "bin/client.exe",
           "bin/libopus-0.dll",
-          "bin/libportaudio.dll"
+          "bin/libportaudio.dll",
+          "bin/libwinpthread-1.dll",
+          "bin/libatomic-1.dll",
+          "bin/libgcc_s_seh-1.dll",
+          "bin/libgomp-1.dll",
+          "bin/libquadmath-0.dll",
+          "bin/libstdc++-6.dll",
+          "bin/libcrypto-3-x64.dll",
+          "bin/libssl-3-x64.dll",
+          "bin/libopusfile-0.dll",
+          "bin/libopusurl-0.dll",
+          "bin/libportaudiocpp.dll",
+          "bin/libogg-0.dll"
         ]
       },
       "makers": [

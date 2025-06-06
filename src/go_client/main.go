@@ -3,9 +3,11 @@ package main
 import (
 	"bufio"
 	"fmt"
+	"io"
 	"math"
 	"net"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -30,8 +32,9 @@ const (
 	vadHangoverTimeMs    = 250   // Время удержания VAD в миллисекундах (было 150)
 
 	// Константы буферизации
-	inputBufferMultiplier = 3 // Размер входного буфера относительно frameSize
-	minBufferThreshold    = 7 // Минимальное количество фреймов для начала воспроизведения
+	inputBufferMultiplier = 3    // Размер входного буфера относительно frameSize
+	minBufferThreshold    = 7    // Минимальное количество фреймов для начала воспроизведения
+	fileChunkSize         = 1024 // Размер одного чанка файла в байтах
 )
 
 var (
@@ -540,6 +543,124 @@ func (ac *AppController) HandleExitCommand() bool {
 	return true
 }
 
+func (ac *AppController) HandleSendFileCommand(filePath string) {
+	if ac.mainConn == nil {
+		fmt.Println("Нет активного соединения с сервером.")
+		return
+	}
+
+	file, err := os.Open(filePath)
+	if err != nil {
+		fmt.Printf("Ошибка открытия файла '%s': %v\n> ", filePath, err)
+		return
+	}
+	defer file.Close()
+
+	fileInfo, err := file.Stat()
+	if err != nil {
+		fmt.Printf("Ошибка получения информации о файле '%s': %v\n> ", filePath, err)
+		return
+	}
+
+	filename := filepath.Base(filePath)
+	fileSize := fileInfo.Size()
+
+	// 1. Отправляем серверу уведомление о начале загрузки файла
+	// Формат: FILE_UPLOAD_START::<filename>::<filesize>
+	startMsg := fmt.Sprintf("FILE_UPLOAD_START::%s::%d", filename, fileSize)
+	_, err = ac.mainConn.Write([]byte(startMsg))
+	if err != nil {
+		fmt.Printf("Ошибка отправки команды FILE_UPLOAD_START: %v\n> ", err)
+		return
+	}
+	fmt.Printf("Начинаю отправку файла '%s' (размер: %d байт)...\n> ", filename, fileSize)
+
+	// 2. Читаем и отправляем файл чанками
+	// Формат чанка: FILE_CHUNK::<filename>::<chunk_data_base64_encoded_или_просто_bytes>
+	// Для простоты сейчас будем отправлять просто байты, но UDP может их фрагментировать или терять.
+	// Использование filename в каждом чанке — это простой способ идентификации файла на сервере для этой сессии.
+	// Более надежно было бы получить от сервера уникальный ID для загрузки.
+
+	buffer := make([]byte, fileChunkSize)
+	chunkNumber := 0
+	for {
+		bytesRead, err := file.Read(buffer)
+		if err != nil {
+			if err == io.EOF {
+				break // Конец файла
+			}
+			fmt.Printf("Ошибка чтения файла '%s': %v\n> ", filename, err)
+			return
+		}
+
+		chunkData := buffer[:bytesRead]
+		// ВАЖНО: Прямая отправка сырых байт файла в UDP пакете вместе с текстовым префиксом
+		// может быть проблематичной для парсинга на сервере, если данные файла содержат '::'.
+		// Лучше чанк данных кодировать (например, в Base64) или отправлять длину чанка.
+		// Для упрощения, сейчас мы этого не делаем, но это слабое место.
+		// Более надежный формат чанка: FILE_CHUNK::<filename>::<chunk_number>::<данные_чанка>
+		// И сервер должен знать, сколько байт данных ожидать после заголовка.
+
+		// Простой вариант (может быть не очень надежным для парсинга):
+		// chunkMsg := []byte(fmt.Sprintf("FILE_CHUNK::%s::", filename))
+		// chunkMsg = append(chunkMsg, chunkData...)
+
+		// Слегка улучшенный вариант с номером чанка (поможет серверу, если захочет проверять порядок):
+		// Для идентификации файла на сервере, если один юзер шлет несколько файлов одновременно,
+		// или если мы не ждем ответа от сервера FILE_UPLOAD_ACK с file_id,
+		// можно использовать комбинацию ac.username + filename (если username доступен в AppController).
+		// Пока что будем полагаться на filename, переданный в FILE_UPLOAD_START.
+		// Сервер будет ассоциировать последующие FILE_CHUNK с этим filename от данного addr.
+
+		// Формат чанка: FILE_CHUNK_DATA::{данные}
+		// Сервер будет ожидать FILE_CHUNK_DATA после FILE_UPLOAD_START от того же клиента
+		// Для большей надежности, каждый чанк должен содержать идентификатор файла и номер чанка.
+		// Давайте сделаем так: FILE_CHUNK::<filename>::<chunk_num>::<data>
+		// Но для простоты сейчас: мы просто шлем данные. Сервер будет их ассоциировать с последним FILE_UPLOAD_START от этого клиента.
+
+		// Простой вариант: сервер просто собирает все, что пришло после FILE_UPLOAD_START
+		// Мы будем отправлять только данные чанка. Сервер должен знать, что после FILE_UPLOAD_START
+		// от этого адреса идут данные файла. Это очень упрощенно.
+
+		// --- Вариант с более явной передачей чанков ---
+		// Чтобы сервер мог отличить чанки от других сообщений и связать их с файлом,
+		// лучше добавить префикс и идентификатор.
+		// Префикс FILE_CHUNK_DATA::filename::chunk_num::данные
+		// Однако, сейчас ac.username здесь может быть не актуален, если он обновляется сервером.
+		// Будем использовать filename как идентификатор для чанков.
+
+		// Формат чанка: CHUNK_PAYLOAD::данные (сервер должен сам следить за файлом, к которому это относится)
+		// Это самый простой, но и самый хрупкий вариант.
+		// Давайте сделаем чуть лучше:
+		// CHUNK_MSG::filename::данные_чанка (имя файла для идентификации на сервере)
+		// Сервер после FILE_UPLOAD_START::filename::size будет ожидать CHUNK_MSG::filename::data от этого клиента
+
+		chunkMsgHeader := fmt.Sprintf("FILE_CHUNK_PAYLOAD::%s::", filename)
+		fullChunkMsg := append([]byte(chunkMsgHeader), chunkData...)
+
+		_, err = ac.mainConn.Write(fullChunkMsg)
+		if err != nil {
+			fmt.Printf("Ошибка отправки чанка файла '%s': %v\n> ", filename, err)
+			// Здесь можно решить, прерывать ли отправку или пытаться повторить (сложнее)
+			return
+		}
+		chunkNumber++
+		// Небольшая задержка, чтобы не перегружать сеть/сервер слишком быстро
+		time.Sleep(5 * time.Millisecond) // Можно подобрать значение
+	}
+
+	// 3. Отправляем уведомление о конце загрузки
+	// Формат: FILE_UPLOAD_END::<filename>
+	endMsg := fmt.Sprintf("FILE_UPLOAD_END::%s", filename)
+	_, err = ac.mainConn.Write([]byte(endMsg))
+	if err != nil {
+		fmt.Printf("Ошибка отправки команды FILE_UPLOAD_END для '%s': %v\n> ", filename, err)
+	} else {
+		fmt.Printf("Файл '%s' успешно отправлен (все чанки переданы).\n> ", filename)
+	}
+	fmt.Print("> ") // Возвращаем приглашение для ввода
+}
+
 func main() {
 	if err := initPortAudio(); err != nil {
 		fmt.Printf("Ошибка инициализации PortAudio: %v\n", err)
@@ -610,12 +731,13 @@ func main() {
 					appController.isAuthenticated = true
 					fmt.Printf("Успешный вход как %s.\n", appController.username)
 					// После успешного логина выводим команды, как и раньше
-					fmt.Println("\nДоступные команды:")
-					fmt.Println("/voice - подключиться к голосовому чату")
-					fmt.Println("/leave - отключиться от голосового чата")
-					fmt.Println("/exit - выйти из чата")
-					fmt.Println("Любой другой текст будет отправлен как сообщение")
-					fmt.Print("> ")
+					//fmt.Println("\nДоступные команды:")
+					//fmt.Println("/voice - подключиться к голосовому чату")
+					//fmt.Println("/leave - отключиться от голосового чата")
+					//fmt.Println("/exit - выйти из чата")
+					//fmt.Println("/sendfile - отправить файл")
+					//fmt.Println("Любой другой текст будет отправлен как сообщение")
+					//fmt.Print("> ")
 				}
 			} else if strings.HasPrefix(serverMessage, "LOGIN_FAILURE::") {
 				reason := strings.TrimPrefix(serverMessage, "LOGIN_FAILURE::")
@@ -634,19 +756,20 @@ func main() {
 			} else {
 				// Обработка сообщений после успешной аутентификации
 				if strings.HasPrefix(serverMessage, "USER_LIST::") {
-					jsonPart := strings.TrimPrefix(serverMessage, "USER_LIST::")
-					fmt.Printf("USER_LIST::%s\n", jsonPart)
+					// jsonPart := strings.TrimPrefix(serverMessage, "USER_LIST::")
+					// fmt.Printf("USER_LIST::%s\n", jsonPart) // Закомментировано, чтобы не выводить в чат
+					// Сюда необходимо добавить логику для передачи jsonPart в UI для обновления списка пользователей
 				} else if strings.HasPrefix(serverMessage, "STATUS_UPDATE::") {
 					// Формат SERVER_USER_STATUS_UPDATE::user::status был заменен на STATUS_UPDATE::user::status
 					// прямо из сервера, поэтому старый SERVER_USER_STATUS_UPDATE уже не нужен
 					fmt.Printf("%s\n", serverMessage) // Просто передаем как есть
 				} else if strings.HasPrefix(serverMessage, "SERVER_USER_JOINED::") { // Это сообщение больше не должно приходить, т.к. есть STATUS_UPDATE
 					userNameJoined := strings.TrimPrefix(serverMessage, "SERVER_USER_JOINED::")
-					fmt.Printf("STATUS_UPDATE::%s::online\n", userNameJoined)
+					//fmt.Printf("STATUS_UPDATE::%s::online\n", userNameJoined)
 					fmt.Printf("%s joined the chat\n", userNameJoined)
 				} else if strings.HasPrefix(serverMessage, "SERVER_USER_LEFT::") { // Это сообщение больше не должно приходить
 					userNameLeft := strings.TrimPrefix(serverMessage, "SERVER_USER_LEFT::")
-					fmt.Printf("STATUS_UPDATE::%s::offline\n", userNameLeft)
+					//fmt.Printf("STATUS_UPDATE::%s::offline\n", userNameLeft)
 					fmt.Printf("%s left the chat\n", userNameLeft)
 				} else {
 					fmt.Printf("%s\n", serverMessage)
@@ -702,6 +825,19 @@ func main() {
 				appController.HandleLeaveCommand()
 			case "/exit":
 				shouldExit = appController.HandleExitCommand()
+			case "/sendfile":
+				if !appController.isAuthenticated {
+					fmt.Println("Сначала войдите в чат для отправки файлов.")
+					//fmt.Print("> ")
+					continue
+				}
+				filePath := strings.TrimSpace(strings.TrimPrefix(text, "/sendfile "))
+				if filePath == "" {
+					fmt.Println("Укажите путь к файлу: /sendfile <путь_к_файлу>")
+					fmt.Print("> ")
+				} else {
+					go appController.HandleSendFileCommand(filePath) // Запускаем в горутине, чтобы не блокировать ввод
+				}
 			default:
 				// Отправляем обычное сообщение. Имя пользователя теперь берется из appController.username,
 				// которое было установлено сервером.
@@ -721,7 +857,7 @@ func main() {
 				return // Завершаем main
 			}
 			if appController.isAuthenticated { // Показываем приглашение только после успешного входа
-				fmt.Print("> ")
+				//fmt.Print("> ")
 			}
 
 		case err := <-scanErrChan:

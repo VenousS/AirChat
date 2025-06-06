@@ -12,6 +12,7 @@
         <div class="logo">
             <span class="z-icon">A</span> <span class="logo-text">Airchat</span>
         </div>
+        <button id="theme-cycle-btn" class="control-btn" title="Сменить тему">🎨 Тема</button>
     </header>
 
     <div id="login-container" class="container">
@@ -83,6 +84,7 @@
                         <button id="voiceChatBtn" class="control-btn">🎤 Голосовой чат</button>
                         <button id="exitChatBtn" class="control-btn">🚪 Выйти</button>
                     </div>
+                    <div id="username-display"></div>
                 </div>
                 
                 <div id="message-area" class="message-area"></div>
@@ -93,14 +95,6 @@
                 </div>
             </div>
         </div>
-    </div>
-
-    <div class="theme-switcher">
-        <h3>Смена Темы:</h3>
-        <button data-theme="light">Светлая</button>
-        <button data-theme="dark">Темная</button>
-        <button data-theme="ocean">Океаническая</button>
-        <button data-theme="forest">Лесная</button>
     </div>
 
     <script src="./renderer.js"></script>

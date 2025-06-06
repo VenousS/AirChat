@@ -42,6 +42,48 @@ document.addEventListener('DOMContentLoaded', () => {
     let userStatuses = {}; // Для хранения статусов { username: 'status' }
     let isAuthenticatedByClient = false; // Флаг успешной аутентификации
 
+    // --- Начало кода для переключения тем ---
+    const themes = ['light', 'dark', 'ocean', 'forest'];
+    const themeDisplayNames = {
+        'light': 'Светлая',
+        'dark': 'Темная',
+        'ocean': 'Океан',
+        'forest': 'Лес'
+    };
+    let currentThemeIndex = 0;
+    const themeCycleButton = document.getElementById('theme-cycle-btn');
+
+    function applyTheme(themeName) {
+        document.body.setAttribute('data-theme', themeName);
+        if (themeCycleButton) {
+            themeCycleButton.textContent = `🎨 ${themeDisplayNames[themeName] || 'Тема'}`;
+        }
+        localStorage.setItem('selectedTheme', themeName);
+        // Обновляем currentThemeIndex, если тема была загружена из localStorage
+        const storedThemeIndex = themes.indexOf(themeName);
+        if (storedThemeIndex !== -1) {
+            currentThemeIndex = storedThemeIndex;
+        }
+    }
+
+    if (themeCycleButton) {
+        themeCycleButton.addEventListener('click', () => {
+            currentThemeIndex = (currentThemeIndex + 1) % themes.length;
+            applyTheme(themes[currentThemeIndex]);
+        });
+
+        // Применение сохраненной темы или темы по умолчанию при загрузке
+        const savedTheme = localStorage.getItem('selectedTheme');
+        if (savedTheme && themes.includes(savedTheme)) {
+            applyTheme(savedTheme);
+        } else {
+            applyTheme(themes[0]); // Тема по умолчанию - первая из списка
+        }
+    } else {
+        console.warn('Кнопка для циклического переключения тем #theme-cycle-btn не найдена.');
+    }
+    // --- Конец кода для переключения тем ---
+
     // Получаем начальные данные от основного процесса
     ipcRenderer.on('initial-data', (event, data) => {
         addLog(`Received initial data from main: resourcesPath=${data.resourcesPath}, isPackaged=${data.isPackaged}`);
@@ -307,7 +349,7 @@ document.addEventListener('DOMContentLoaded', () => {
                     
                     if (!handleServerStartMessage(message)) {
                         // Дополнительная обработка других сообщений из stdout, если необходимо
-                        if (message.includes('Новый клиент:')) {
+                        if (message.includes('Новый пользователь') && message.includes('успешно аутентифицирован')) {
                             elements.connectedUsers.textContent = (parseInt(elements.connectedUsers.textContent) || 0) + 1;
                         } else if (message.includes('вошёл в голосовой чат')) {
                             elements.voiceUsers.textContent = (parseInt(elements.voiceUsers.textContent) || 0) + 1;
@@ -338,7 +380,7 @@ document.addEventListener('DOMContentLoaded', () => {
                     if (!serverStarted) {
                         // Обработка других сообщений из stderr, если это не ошибка и не сообщение о старте
                         // (например, другие информационные сообщения от Go log)
-                        if (message.includes('Новый клиент:')) {
+                        if (message.includes('Новый пользователь') && message.includes('успешно аутентифицирован')) {
                             elements.connectedUsers.textContent = (parseInt(elements.connectedUsers.textContent) || 0) + 1;
                         } else if (message.includes('вошёл в голосовой чат')) {
                             elements.voiceUsers.textContent = (parseInt(elements.voiceUsers.textContent) || 0) + 1;

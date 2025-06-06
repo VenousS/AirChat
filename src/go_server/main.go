@@ -4,11 +4,14 @@ import (
 	"crypto/rand" // Для генерации токенов
 	"encoding/hex"
 	"encoding/json"
+	"fmt" // Для удобной записи файла (или использовать os.File)
 	"log"
 	"math"
 	"net"
 	"os"
 	"os/signal"
+	"path/filepath" // Для безопасного создания путей
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -82,6 +85,25 @@ type UserStatusInfo struct {
 	Username string `json:"username"`
 	Status   string `json:"status"`
 }
+
+type FileTransferState struct {
+	ClientAddr     net.Addr  // Адрес клиента, загружающего файл
+	Filename       string    // Имя файла, как его передал клиент
+	ServerFilename string    // Уникальное имя файла на сервере
+	FileSize       int64     // Ожидаемый размер файла
+	ReceivedSize   int64     // Уже получено байт
+	TempFile       *os.File  // Временный файл для сборки
+	LastActivity   time.Time // Для таймаута неактивных загрузок
+}
+
+// Карта для отслеживания текущих загрузок файлов
+// Ключ - строка, идентифициющая загрузку, например, clientAddr.String() + "::" + clientFilename
+// Или, если клиент присылает уникальный ID загрузки.
+// Сейчас будем использовать clientAddr.String() как ключ к информации о том, какой файл он грузит.
+var activeFileUploads = make(map[string]*FileTransferState) // Ключ: clientAddr.String()
+var fileUploadsMux sync.Mutex
+
+const uploadDir = "./uploads/" // Директория для сохранения загруженных файлов
 
 func generateSecureToken(length int) (string, error) {
 	b := make([]byte, length)
@@ -417,6 +439,24 @@ func handleVoiceData(voiceConn net.PacketConn, pc net.PacketConn) {
 	}
 }
 
+func cleanupInactiveUploads() {
+	for {
+		time.Sleep(1 * time.Minute) // Проверять раз в минуту
+		fileUploadsMux.Lock()
+		now := time.Now()
+		for key, state := range activeFileUploads {
+			if now.Sub(state.LastActivity) > 5*time.Minute { // Таймаут 5 минут
+				log.Printf("Таймаут загрузки файла '%s' от %s. Удаление.", state.Filename, state.ClientAddr.String())
+				state.TempFile.Close()
+				os.Remove(state.TempFile.Name())
+				delete(activeFileUploads, key)
+				// Можно уведомить клиента, если он еще онлайн
+			}
+		}
+		fileUploadsMux.Unlock()
+	}
+}
+
 func mainLoop(pc net.PacketConn, voiceConn net.PacketConn, audioProcessor *AudioProcessor) {
 	for {
 		buffer := make([]byte, 4096)
@@ -615,6 +655,198 @@ func mainLoop(pc net.PacketConn, voiceConn net.PacketConn, audioProcessor *Audio
 			continue
 		}
 
+		// Проверяем, аутентифицирован ли клиент, прежде чем обрабатывать сообщения, КРОМЕ LOGIN
+		if !clientAuthenticatedAndExists || client.username == "" || client.Status == StatusOffline {
+			// Если это не LOGIN сообщение и клиент не аутентифицирован/не существует, пропускаем
+			if !(len(parts) > 0 && strings.TrimSpace(parts[0]) == "LOGIN") {
+				continue
+			}
+		}
+		// Если это не LOGIN, то client должен быть != nil к этому моменту
+		// Если это LOGIN, то client еще может быть nil, он создастся ниже
+
+		// Новые обработчики для файлов
+		if clientAuthenticatedAndExists && client != nil { // Убедимся, что client существует для файловых операций
+			if strings.HasPrefix(msg, "FILE_UPLOAD_START::") {
+				partsFile := strings.SplitN(msg, "::", 3)
+				if len(partsFile) == 3 {
+					clientFilename := strings.TrimSpace(partsFile[1])
+					fileSizeStr := strings.TrimSpace(partsFile[2])
+					fileSize, errConv := strconv.ParseInt(fileSizeStr, 10, 64)
+					if errConv != nil {
+						log.Printf("Ошибка конвертации размера файла от %s для '%s': %v", client.username, clientFilename, errConv)
+						// Можно отправить ошибку клиенту
+						continue
+					}
+
+					fileUploadsMux.Lock()
+					// Проверяем, нет ли уже активной загрузки от этого клиента
+					if existingState, ok := activeFileUploads[addr.String()]; ok {
+						log.Printf("Клиент %s уже загружает файл %s. Новая загрузка %s отклонена или прервет старую.",
+							client.username, existingState.Filename, clientFilename)
+						existingState.TempFile.Close()           // Закрываем старый временный файл
+						os.Remove(existingState.TempFile.Name()) // Удаляем старый временный файл
+						// Можно отправить уведомление клиенту о прерывании старой загрузки
+					}
+
+					// Создаем уникальное имя файла на сервере, чтобы избежать коллизий
+					// Например, username_timestamp_originalfilename
+					serverSideFilename := fmt.Sprintf("%s_%d_%s", client.username, time.Now().UnixNano(), filepath.Base(clientFilename))
+					tempFilePath := filepath.Join(uploadDir, serverSideFilename+".tmp")
+
+					tempFile, errFile := os.Create(tempFilePath)
+					if errFile != nil {
+						log.Printf("Ошибка создания временного файла '%s' для клиента %s: %v", tempFilePath, client.username, errFile)
+						fileUploadsMux.Unlock()
+						continue
+					}
+
+					state := &FileTransferState{
+						ClientAddr:     addr,
+						Filename:       clientFilename,
+						ServerFilename: serverSideFilename, // Будет использоваться после завершения
+						FileSize:       fileSize,
+						ReceivedSize:   0,
+						TempFile:       tempFile,
+						LastActivity:   time.Now(),
+					}
+					activeFileUploads[addr.String()] = state
+					fileUploadsMux.Unlock()
+
+					log.Printf("Клиент %s (%s) начал загрузку файла '%s' (размер: %d байт). Временный файл: %s",
+						client.username, addr.String(), clientFilename, fileSize, tempFilePath)
+
+					// Уведомляем других клиентов
+					broadcastMsg := []byte(fmt.Sprintf("[%s] начал загрузку файла: %s", client.username, clientFilename))
+					go broadcastToOthers(broadcastMsg, addr, pc)
+
+				} else {
+					log.Printf("Некорректный формат FILE_UPLOAD_START от %s: %s", client.username, msg)
+				}
+				continue // Сообщение обработано
+			}
+
+			if strings.HasPrefix(msg, "FILE_CHUNK_PAYLOAD::") {
+				fileUploadsMux.Lock()
+				state, uploadInProgress := activeFileUploads[addr.String()]
+				if !uploadInProgress {
+					fileUploadsMux.Unlock()
+					// log.Printf("Получен чанк от %s, но нет активной загрузки.", client.username) // Может быть слишком много логов
+					continue
+				}
+
+				// Ожидаемый формат: FILE_CHUNK_PAYLOAD::filename_sent_by_client::chunk_data
+				// filename_sent_by_client нам нужен, чтобы убедиться, что чанк относится к текущему файлу
+				partsChunk := strings.SplitN(msg, "::", 3)
+				if len(partsChunk) == 3 {
+					chunkFilename := partsChunk[1]
+					if chunkFilename != state.Filename {
+						fileUploadsMux.Unlock()
+						log.Printf("Имя файла в чанке ('%s') не совпадает с ожидаемым ('%s') от %s.",
+							chunkFilename, state.Filename, client.username)
+						continue
+					}
+
+					// Данные чанка - это все, что после второго '::'
+					// ВНИМАНИЕ: этот способ парсинга предполагает, что filename не содержит '::'
+					// и что данные начинаются сразу после второго '::'.
+					// Более надежно было бы, если бы клиент отправлял длину данных чанка.
+					// Здесь мы берем msg[len(partsChunk[0])+len("::")+len(partsChunk[1])+len("::"):]
+					headerLength := len(partsChunk[0]) + len("::") + len(partsChunk[1]) + len("::")
+					chunkData := buffer[headerLength:n] // Используем исходный buffer и n
+
+					_, errWrite := state.TempFile.Write(chunkData)
+					if errWrite != nil {
+						log.Printf("Ошибка записи чанка в файл '%s' для %s: %v", state.TempFile.Name(), client.username, errWrite)
+						// Можно прервать загрузку
+						state.TempFile.Close()
+						os.Remove(state.TempFile.Name())
+						delete(activeFileUploads, addr.String())
+						fileUploadsMux.Unlock()
+						// Уведомить клиента об ошибке
+						pc.WriteTo([]byte(fmt.Sprintf("FILE_UPLOAD_ERROR::%s::%s", state.Filename, "server_write_error")), addr)
+						continue
+					}
+					state.ReceivedSize += int64(len(chunkData))
+					state.LastActivity = time.Now()
+					fileUploadsMux.Unlock()
+
+					// Можно периодически логировать прогресс, но не слишком часто
+					// log.Printf("Получен чанк для '%s' от %s. Получено %d/%d", state.Filename, client.username, state.ReceivedSize, state.FileSize)
+
+				} else {
+					fileUploadsMux.Unlock()
+					log.Printf("Некорректный формат FILE_CHUNK_PAYLOAD от %s: (мало частей)", client.username)
+				}
+				continue // Сообщение обработано
+			}
+
+			if strings.HasPrefix(msg, "FILE_UPLOAD_END::") {
+				fileUploadsMux.Lock()
+				state, uploadInProgress := activeFileUploads[addr.String()]
+				if !uploadInProgress {
+					fileUploadsMux.Unlock()
+					log.Printf("Получен FILE_UPLOAD_END от %s, но нет активной загрузки.", client.username)
+					continue
+				}
+
+				// Формат FILE_UPLOAD_END::filename
+				endFilename := strings.TrimPrefix(msg, "FILE_UPLOAD_END::")
+				if endFilename != state.Filename {
+					fileUploadsMux.Unlock()
+					log.Printf("Имя файла в FILE_UPLOAD_END ('%s') не совпадает с ожидаемым ('%s') от %s.",
+						endFilename, state.Filename, client.username)
+					// Это может быть нормально, если предыдущая загрузка была прервана и началась новая.
+					// Но если state.Filename актуален, то это расхождение.
+					continue
+				}
+
+				errClose := state.TempFile.Close()
+				if errClose != nil {
+					log.Printf("Ошибка закрытия временного файла '%s' для %s: %v", state.TempFile.Name(), client.username, errClose)
+					// Файл может быть уже поврежден или не полностью записан
+				}
+
+				finalPath := filepath.Join(uploadDir, state.ServerFilename) // Используем уникальное серверное имя
+				errRename := os.Rename(state.TempFile.Name(), finalPath)
+				if errRename != nil {
+					log.Printf("Ошибка переименования временного файла '%s' в '%s' для %s: %v",
+						state.TempFile.Name(), finalPath, client.username, errRename)
+					os.Remove(state.TempFile.Name()) // Удаляем временный, если не удалось переименовать
+					delete(activeFileUploads, addr.String())
+					fileUploadsMux.Unlock()
+					pc.WriteTo([]byte(fmt.Sprintf("FILE_UPLOAD_ERROR::%s::%s", state.Filename, "server_finalize_error")), addr)
+					continue
+				}
+
+				log.Printf("Файл '%s' (сохранен как '%s', %d/%d байт) от %s успешно загружен.",
+					state.Filename, state.ServerFilename, state.ReceivedSize, state.FileSize, client.username)
+
+				delete(activeFileUploads, addr.String())
+				fileUploadsMux.Unlock()
+
+				// Уведомляем всех клиентов о новом файле
+				// Сообщение может содержать имя оригинального файла и кто отправил.
+				// Как другие клиенты будут скачивать файл - это отдельный вопрос (например, через HTTP-сервер или команду /downloadfile <server_filename>)
+				fileNotificationMsg := []byte(fmt.Sprintf("Новый файл от [%s]: %s (сохранен на сервере как: %s)", client.username, state.Filename, state.ServerFilename))
+				go broadcastToAllClients(fileNotificationMsg, pc)
+
+				// Уведомление отправителю об успехе
+				pc.WriteTo([]byte(fmt.Sprintf("FILE_UPLOAD_SUCCESS::%s", state.Filename)), addr)
+				continue // Сообщение обработано
+			}
+		} // Конец if clientAuthenticatedAndExists && client != nil
+
+		// ... ваш существующий код обработки обычных сообщений, VOICE_CONNECT, /exit и т.д. ...
+		// Убедитесь, что этот блок идет ПОСЛЕ обработки файловых сообщений,
+		// или используйте `continue` в файловых обработчиках, чтобы не попасть сюда.
+
+		// Пример того, где может быть существующая логика:
+		// if msg == "VOICE_CONNECT" { ... }
+		// else if msg == "VOICE_DISCONNECT" { ... }
+		// else if strings.TrimSpace(msg) == "/exit" { ... }
+		// else { /* обработка обычного текстового сообщения */ }
+
 		chatMessage := []byte("[" + client.username + "]: " + msg)
 		clientsMux.Unlock()
 		go broadcastToOthers(chatMessage, addr, pc)
@@ -635,6 +867,15 @@ func main() {
 	}
 	defer cleanup(pc, voiceConn)
 
+	// Создаем директорию для загрузок, если ее нет
+	if _, err := os.Stat(uploadDir); os.IsNotExist(err) {
+		err = os.MkdirAll(uploadDir, 0755) // 0755 - права доступа
+		if err != nil {
+			log.Fatalf("Не удалось создать директорию для загрузок '%s': %v", uploadDir, err)
+		}
+		log.Printf("Создана директория для загрузок: %s", uploadDir)
+	}
+
 	log.Println("Сервер запущен на порту :6000")
 	log.Println("Голосовой сервер запущен на порту :6001")
 	audioProcessor := NewAudioProcessor()
@@ -648,5 +889,6 @@ func main() {
 		cleanup(pc, voiceConn)
 		os.Exit(0)
 	}()
+	go cleanupInactiveUploads() // Запустить эту горутину
 	mainLoop(pc, voiceConn, audioProcessor)
 }
