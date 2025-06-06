@@ -1,51 +1,103 @@
 <!DOCTYPE html>
-<html>
+<html lang="ru">
 <head>
     <meta charset="UTF-8">
-    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'">
-    <link rel="stylesheet" href="style.css">
-
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'unsafe-inline'">
     <title>AirChat</title>
+    <link rel="stylesheet" href="style.css">
 </head>
 <body>
     <header>
         <div class="logo">
-            <span class="z-icon">ℤ</span>
-            <span class="logo-text">AirChat</span>
+            <span class="z-icon">A</span> <span class="logo-text">Airchat</span>
         </div>
+        <button id="theme-cycle-btn" class="control-btn" title="Сменить тему">🎨 Тема</button>
     </header>
-    
+
     <div id="login-container" class="container">
-        <h1>Добро пожаловать в AirChat</h1>
+        <h1>sign in</h1>
         <div class="form-group">
-            <input type="text" id="username" placeholder="Ваше имя" class="input-field">
+            <label for="username">Имя</label>
+            <input type="text" id="username" class="input-field">
         </div>
         <div class="form-group">
-            <input type="text" id="server-ip" placeholder="IP сервера (например, 127.0.0.1)" class="input-field">
+            <label for="server-ip">IP-адрес сервера</label>
+            <input type="text" id="server-ip" class="input-field">
         </div>
         <div class="form-group">
+            <label for="password">Пароль</label>
+            <input type="password" id="password" class="input-field">
+        </div>
+        <div class="form-group button-group">
             <button class="chat-button" id="createRoomBtn">Создать комнату</button>
-            <button class="chat-button" id="connectButton">Войти в чат</button>
+            <button class="chat-button" id="connectButton">Зайти в комнату</button>
+        </div>
+    </div>
+
+    <div id="server-container" class="container server-management" style="display:none;">
+        <h1>Панель управления сервером</h1>
+        <div class="server-status">
+            <h2>Статус сервера</h2>
+            <div id="status-indicator" class="status-indicator offline">Offline</div>
+        </div>
+        
+        <div class="server-info">
+            <div class="info-item">
+                <label>Server IP:</label>
+                <span id="server-ip-display">127.0.0.1</span>
+            </div>
+            <div class="info-item">
+                <label>Подключенные пользователи:</label>
+                <span id="connected-users">0</span>
+            </div>
+            <div class="info-item">
+                <label>Пользователи голосового чата:</label>
+                <span id="voice-users">0</span>
+            </div>
+        </div>
+
+        <div class="server-controls">
+            <button id="startServerBtn" class="chat-button">Запустить сервер</button>
+            <button id="stopServerBtn" class="chat-button" disabled>Остановить сервер</button>
+            <button id="backToLoginBtn" class="chat-button">Вернуться к входу</button>
+        </div>
+
+        <div class="server-logs">
+            <h2>Логи сервера</h2>
+            <div id="log-container" class="log-container"></div>
         </div>
     </div>
 
     <div id="chat-container" class="chat-window" style="display:none;">
-        <div class="chat-header">
-            <h2>AirChat</h2>
-            <div class="chat-controls">
-                <button id="voiceChatBtn" class="control-btn">🎤 Голосовой чат</button>
-                <button id="exitChatBtn" class="control-btn">🚪 Выйти</button>
+        <div class="chat-layout-container">
+            <div id="chat-sidebar">
+                <h3>Участники</h3>
+                <div id="user-list-area">
+                    <!-- Список пользователей будет здесь -->
+                </div>
             </div>
-        </div>
-        
-        <div id="message-area" class="message-area"></div>
-        
-        <div class="message-input">
-            <input type="text" id="message-input" placeholder="Введите сообщение..." class="input-field">
-            <button id="sendBtn" class="send-btn">Отправить</button>
+            <div id="chat-main-content">
+                <div class="chat-header">
+                    <h2>AirChat</h2>
+                    <div class="chat-controls">
+                        <button id="voiceChatBtn" class="control-btn">🎤 Голосовой чат</button>
+                        <button id="exitChatBtn" class="control-btn">🚪 Выйти</button>
+                    </div>
+                    <div id="username-display"></div>
+                </div>
+                
+                <div id="message-area" class="message-area"></div>
+                
+                <div class="message-input">
+                    <input type="text" id="message-input" placeholder="Введите сообщение..." class="input-field">
+                    <button id="sendBtn" class="send-btn">Отправить</button>
+                </div>
+            </div>
         </div>
     </div>
 
     <script src="./renderer.js"></script>
+    <script src="script.js"></script>
 </body>
 </html>
